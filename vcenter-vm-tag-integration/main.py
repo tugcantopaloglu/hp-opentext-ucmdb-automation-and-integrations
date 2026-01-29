@@ -29,7 +29,7 @@ from pyVmomi import vim
 from requests.adapters import HTTPAdapter
 from urllib3.util.retry import Retry
 
-__version__ = "1.0.0"
+__version__ = "2.0.0"
 
 # =============================================================================
 # CONFIGURATION
@@ -43,6 +43,11 @@ class VMwareConfig:
     password: str
     port: int = 443
     disable_ssl_verification: bool = False
+    name: str = ""
+
+    def __post_init__(self):
+        if not self.name:
+            self.name = self.host
 
 
 @dataclass
@@ -69,8 +74,8 @@ class SyncConfig:
 
 @dataclass
 class AppConfig:
-    """Main application configuration"""
-    vmware: VMwareConfig
+    """Main application configuration (multi-vCenter)"""
+    vmware: List[VMwareConfig]
     smax: SMAXConfig
     sync: SyncConfig
 
@@ -88,6 +93,7 @@ class VMInfo:
     ip_address: Optional[str]
     tags: Dict[str, List[str]]
     guest_hostname: Optional[str] = None
+    vcenter: str = ""
 
     def get_owner_tag(self, owner_category: str) -> Optional[str]:
         """Get the owner tag value from the specified category"""
@@ -133,6 +139,7 @@ class SyncResult:
     resolved_owner_id: Optional[str] = None
     ci_id: Optional[str] = None
     previous_owner: Optional[str] = None
+    vcenter: str = ""
 
 
 @dataclass
@@ -149,6 +156,7 @@ class SyncReport:
     owner_not_resolved: int = 0
     already_synced: int = 0
     results: List[SyncResult] = field(default_factory=list)
+    vcenters_processed: List[str] = field(default_factory=list)
 
     def add_result(self, result: SyncResult) -> None:
         """Add a sync result and update counters"""
@@ -176,6 +184,7 @@ class SyncReport:
             "start_time": self.start_time.isoformat(),
             "end_time": self.end_time.isoformat() if self.end_time else None,
             "duration_seconds": (self.end_time - self.start_time).total_seconds() if self.end_time else None,
+            "vcenters_processed": self.vcenters_processed,
             "summary": {
                 "total_vms": self.total_vms,
                 "synced": self.synced,
@@ -190,6 +199,7 @@ class SyncReport:
                 {
                     "vm_name": r.vm_name,
                     "vm_uuid": r.vm_uuid,
+                    "vcenter": r.vcenter,
                     "status": r.status.value,
                     "message": r.message,
                     "owner_tag": r.owner_tag,
@@ -201,7 +211,7 @@ class SyncReport:
             ],
         }
 
-    def print_summary(self) -> None:
+    def print_summary(self, show_untagged: bool = True) -> None:
         """Print a human-readable summary"""
         print("\n" + "=" * 60)
         print("VMware-SMAX Synchronization Report")
@@ -211,6 +221,8 @@ class SyncReport:
         if self.end_time:
             duration = (self.end_time - self.start_time).total_seconds()
             print(f"Duration: {duration:.2f} seconds")
+        if self.vcenters_processed:
+            print(f"vCenters: {', '.join(self.vcenters_processed)}")
         print("-" * 60)
         print("Summary:")
         print(f"  Total VMs processed: {self.total_vms}")
@@ -221,7 +233,54 @@ class SyncReport:
         print(f"  No owner tag: {self.no_owner_tag}")
         print(f"  Owner not resolved: {self.owner_not_resolved}")
         print(f"  Failed: {self.failed}")
-        print("=" * 60 + "\n")
+        print("=" * 60)
+        if show_untagged and self.no_owner_tag > 0:
+            print("\nVMs WITHOUT OWNER TAG:")
+            print("-" * 60)
+            for r in self.results:
+                if r.status == SyncStatus.NO_OWNER_TAG:
+                    vc = f"[{r.vcenter}] " if r.vcenter else ""
+                    print(f"  {vc}{r.vm_name}")
+            print("-" * 60)
+        print("")
+
+    def save_to_file(self, filepath: str) -> None:
+        """Save report to text file"""
+        with open(filepath, "w") as f:
+            f.write("=" * 60 + "\n")
+            f.write("VMware-SMAX Synchronization Report\n")
+            f.write("=" * 60 + "\n")
+            f.write(f"Start Time: {self.start_time}\n")
+            f.write(f"End Time: {self.end_time}\n")
+            if self.end_time:
+                duration = (self.end_time - self.start_time).total_seconds()
+                f.write(f"Duration: {duration:.2f} seconds\n")
+            if self.vcenters_processed:
+                f.write(f"vCenters: {', '.join(self.vcenters_processed)}\n")
+            f.write("-" * 60 + "\n")
+            f.write("SUMMARY:\n")
+            f.write(f"  Total VMs: {self.total_vms}\n")
+            f.write(f"  Synced: {self.synced}\n")
+            f.write(f"  Already synced: {self.already_synced}\n")
+            f.write(f"  Skipped: {self.skipped}\n")
+            f.write(f"  CI not found: {self.not_found}\n")
+            f.write(f"  No owner tag: {self.no_owner_tag}\n")
+            f.write(f"  Owner not resolved: {self.owner_not_resolved}\n")
+            f.write(f"  Failed: {self.failed}\n")
+            f.write("=" * 60 + "\n\n")
+            untagged = [r for r in self.results if r.status == SyncStatus.NO_OWNER_TAG]
+            if untagged:
+                f.write("VMs WITHOUT OWNER TAG:\n")
+                f.write("-" * 60 + "\n")
+                for r in untagged:
+                    vc = f"[{r.vcenter}] " if r.vcenter else ""
+                    f.write(f"  {vc}{r.vm_name}\n")
+                f.write("-" * 60 + "\n\n")
+            f.write("ALL RESULTS:\n")
+            f.write("-" * 60 + "\n")
+            for r in self.results:
+                vc = f"[{r.vcenter}] " if r.vcenter else ""
+                f.write(f"[{r.status.value.upper()}] {vc}{r.vm_name}: {r.message}\n")
 
 
 # =============================================================================
@@ -461,6 +520,54 @@ class VMwareService:
 
         logger.info(f"Retrieved {len(vms)} VMs with tags")
         return vms
+
+    def __enter__(self):
+        self.connect()
+        return self
+
+    def __exit__(self, exc_type, exc_val, exc_tb):
+        self.disconnect()
+
+
+class MultiVMwareService:
+    """Aggregates VMs from multiple vCenters"""
+
+    def __init__(self, configs: List[VMwareConfig]):
+        self.configs = configs
+        self.services: List[VMwareService] = []
+
+    def connect(self) -> None:
+        for cfg in self.configs:
+            try:
+                svc = VMwareService(cfg)
+                svc.connect()
+                self.services.append(svc)
+                logger.info(f"Connected to vCenter: {cfg.name}")
+            except Exception as e:
+                logger.error(f"Failed to connect to {cfg.name}: {e}")
+
+    def disconnect(self) -> None:
+        for svc in self.services:
+            try:
+                svc.disconnect()
+            except Exception as e:
+                logger.warning(f"Error disconnecting {svc.config.name}: {e}")
+
+    def get_all_vms_with_tags(self) -> List[VMInfo]:
+        all_vms = []
+        for svc in self.services:
+            try:
+                vms = svc.get_vms_with_tags()
+                for vm in vms:
+                    vm.vcenter = svc.config.name
+                all_vms.extend(vms)
+                logger.info(f"Got {len(vms)} VMs from {svc.config.name}")
+            except Exception as e:
+                logger.error(f"Failed to get VMs from {svc.config.name}: {e}")
+        return all_vms
+
+    def get_vcenter_names(self) -> List[str]:
+        return [s.config.name for s in self.services]
 
     def __enter__(self):
         self.connect()
@@ -885,17 +992,17 @@ class SMAXService:
 
 
 class SyncService:
-    """Service to synchronize VMware VM tags with SMAX CI owners"""
+    """Service to synchronize VMware VM tags with SMAX CI owners (multi-vCenter)"""
 
     def __init__(self, config: AppConfig):
         self.config = config
-        self.vmware_service = VMwareService(config.vmware)
+        self.vmware_service = MultiVMwareService(config.vmware)
         self.smax_service = SMAXService(config.smax)
         self.sync_config = config.sync
 
     def connect(self) -> None:
-        """Connect to both VMware and SMAX"""
-        logger.info("Connecting to VMware...")
+        """Connect to all vCenters and SMAX"""
+        logger.info(f"Connecting to {len(self.config.vmware)} vCenter(s)...")
         self.vmware_service.connect()
 
         logger.info("Connecting to SMAX...")
@@ -919,6 +1026,7 @@ class SyncService:
                 vm_uuid=vm.uuid,
                 status=SyncStatus.NO_OWNER_TAG,
                 message=f"No '{self.sync_config.owner_tag_category}' tag found on VM",
+                vcenter=vm.vcenter,
             )
 
         ci = self.smax_service.find_ci_for_vm(
@@ -934,6 +1042,7 @@ class SyncService:
                 status=SyncStatus.NOT_FOUND,
                 message=f"No CI found in SMAX matching VM name '{vm.name}' or IP '{vm.ip_address}'",
                 owner_tag=owner_tag,
+                vcenter=vm.vcenter,
             )
 
         owner_id = self.smax_service.resolve_owner_to_person_id(owner_tag)
@@ -946,9 +1055,9 @@ class SyncService:
                 message=f"Could not resolve owner '{owner_tag}' to a Person in SMAX",
                 owner_tag=owner_tag,
                 ci_id=ci.id,
+                vcenter=vm.vcenter,
             )
 
-        # Check if already synced - compare current owner with resolved owner
         if ci.owner == owner_id:
             return SyncResult(
                 vm_name=vm.name,
@@ -959,6 +1068,7 @@ class SyncService:
                 resolved_owner_id=owner_id,
                 ci_id=ci.id,
                 previous_owner=ci.owner,
+                vcenter=vm.vcenter,
             )
 
         if self.sync_config.dry_run:
@@ -971,6 +1081,7 @@ class SyncService:
                 resolved_owner_id=owner_id,
                 ci_id=ci.id,
                 previous_owner=ci.owner,
+                vcenter=vm.vcenter,
             )
 
         success = self.smax_service.client.update_ci_owner(
@@ -989,6 +1100,7 @@ class SyncService:
                 resolved_owner_id=owner_id,
                 ci_id=ci.id,
                 previous_owner=ci.owner,
+                vcenter=vm.vcenter,
             )
         else:
             return SyncResult(
@@ -1000,17 +1112,19 @@ class SyncService:
                 resolved_owner_id=owner_id,
                 ci_id=ci.id,
                 previous_owner=ci.owner,
+                vcenter=vm.vcenter,
             )
 
     def sync_all(self) -> SyncReport:
-        """Sync all VMs from VMware to SMAX"""
+        """Sync all VMs from all vCenters to SMAX"""
         report = SyncReport(start_time=datetime.now())
+        report.vcenters_processed = self.vmware_service.get_vcenter_names()
 
-        logger.info("Retrieving VMs from VMware...")
-        vms = self.vmware_service.get_vms_with_tags()
+        logger.info("Retrieving VMs from all vCenters...")
+        vms = self.vmware_service.get_all_vms_with_tags()
         report.total_vms = len(vms)
 
-        logger.info(f"Processing {len(vms)} VMs...")
+        logger.info(f"Processing {len(vms)} VMs from {len(report.vcenters_processed)} vCenter(s)...")
 
         for i, vm in enumerate(vms, 1):
             if i % 50 == 0:
@@ -1021,11 +1135,11 @@ class SyncService:
                 report.add_result(result)
 
                 if result.status == SyncStatus.SUCCESS:
-                    logger.info(f"[SYNCED] {vm.name}: {result.message}")
+                    logger.info(f"[SYNCED] [{vm.vcenter}] {vm.name}: {result.message}")
                 elif result.status in [SyncStatus.FAILED, SyncStatus.OWNER_NOT_RESOLVED]:
-                    logger.warning(f"[{result.status.value.upper()}] {vm.name}: {result.message}")
+                    logger.warning(f"[{result.status.value.upper()}] [{vm.vcenter}] {vm.name}: {result.message}")
                 else:
-                    logger.debug(f"[{result.status.value.upper()}] {vm.name}: {result.message}")
+                    logger.debug(f"[{result.status.value.upper()}] [{vm.vcenter}] {vm.name}: {result.message}")
 
             except Exception as e:
                 logger.error(f"Error processing VM {vm.name}: {e}")
@@ -1035,6 +1149,7 @@ class SyncService:
                         vm_uuid=vm.uuid,
                         status=SyncStatus.FAILED,
                         message=str(e),
+                        vcenter=vm.vcenter,
                     )
                 )
 
@@ -1042,17 +1157,18 @@ class SyncService:
         return report
 
     def sync_specific_vms(self, vm_names: List[str]) -> SyncReport:
-        """Sync specific VMs by name"""
+        """Sync specific VMs by name from all vCenters"""
         report = SyncReport(start_time=datetime.now())
+        report.vcenters_processed = self.vmware_service.get_vcenter_names()
 
-        all_vms = self.vmware_service.get_vms_with_tags()
+        all_vms = self.vmware_service.get_all_vms_with_tags()
         vms = [vm for vm in all_vms if vm.name in vm_names]
         report.total_vms = len(vms)
 
         found_names = {vm.name for vm in vms}
         not_found = set(vm_names) - found_names
         if not_found:
-            logger.warning(f"VMs not found in VMware: {not_found}")
+            logger.warning(f"VMs not found in any vCenter: {not_found}")
 
         for vm in vms:
             try:
@@ -1066,6 +1182,7 @@ class SyncService:
                         vm_uuid=vm.uuid,
                         status=SyncStatus.FAILED,
                         message=str(e),
+                        vcenter=vm.vcenter,
                     )
                 )
 
@@ -1102,7 +1219,7 @@ def setup_logging(verbose: bool = False, log_file: str = None) -> None:
 
 
 def load_config_from_file(config_path: str) -> AppConfig:
-    """Load configuration from a JSON file"""
+    """Load configuration from a JSON file (supports single or multi-vCenter)"""
     with open(config_path, "r") as f:
         data = json.load(f)
 
@@ -1110,14 +1227,32 @@ def load_config_from_file(config_path: str) -> AppConfig:
     smax_data = data.get("smax", {})
     sync_data = data.get("sync", {})
 
+    if isinstance(vmware_data, list):
+        vmware_configs = [
+            VMwareConfig(
+                host=vc.get("host", ""),
+                username=vc.get("username", ""),
+                password=vc.get("password", ""),
+                port=vc.get("port", 443),
+                disable_ssl_verification=vc.get("disable_ssl_verification", False),
+                name=vc.get("name", ""),
+            )
+            for vc in vmware_data
+        ]
+    else:
+        vmware_configs = [
+            VMwareConfig(
+                host=vmware_data.get("host", ""),
+                username=vmware_data.get("username", ""),
+                password=vmware_data.get("password", ""),
+                port=vmware_data.get("port", 443),
+                disable_ssl_verification=vmware_data.get("disable_ssl_verification", False),
+                name=vmware_data.get("name", ""),
+            )
+        ]
+
     return AppConfig(
-        vmware=VMwareConfig(
-            host=vmware_data.get("host", ""),
-            username=vmware_data.get("username", ""),
-            password=vmware_data.get("password", ""),
-            port=vmware_data.get("port", 443),
-            disable_ssl_verification=vmware_data.get("disable_ssl_verification", False),
-        ),
+        vmware=vmware_configs,
         smax=SMAXConfig(
             base_url=smax_data.get("base_url", ""),
             tenant_id=smax_data.get("tenant_id", ""),
@@ -1138,15 +1273,26 @@ def load_config_from_file(config_path: str) -> AppConfig:
 
 
 def generate_config_template(output_path: str) -> None:
-    """Generate a configuration template file"""
+    """Generate a configuration template file (multi-vCenter)"""
     template = {
-        "vmware": {
-            "host": "vcenter.example.com",
-            "username": "administrator@vsphere.local",
-            "password": "your-password",
-            "port": 443,
-            "disable_ssl_verification": False,
-        },
+        "vmware": [
+            {
+                "name": "vcenter-prod",
+                "host": "vcenter-prod.example.com",
+                "username": "administrator@vsphere.local",
+                "password": "your-password",
+                "port": 443,
+                "disable_ssl_verification": False,
+            },
+            {
+                "name": "vcenter-dev",
+                "host": "vcenter-dev.example.com",
+                "username": "administrator@vsphere.local",
+                "password": "your-password",
+                "port": 443,
+                "disable_ssl_verification": False,
+            },
+        ],
         "smax": {
             "base_url": "https://smax.example.com",
             "tenant_id": "your-tenant-id",
@@ -1169,17 +1315,20 @@ def generate_config_template(output_path: str) -> None:
         json.dump(template, f, indent=2)
 
     print(f"Configuration template generated: {output_path}")
+    print("Note: vmware can be a single object or array for multi-vCenter")
 
 
 def test_connections(config: AppConfig) -> None:
-    """Test connections to VMware and SMAX"""
-    print("\nTesting VMware connection...")
-    try:
-        with VMwareService(config.vmware) as vmware:
-            vms = vmware.vm_client.get_all_vms()
-            print(f"✓ VMware connection successful - Found {len(vms)} VMs")
-    except Exception as e:
-        print(f"✗ VMware connection failed: {e}")
+    """Test connections to all vCenters and SMAX"""
+    print(f"\nTesting {len(config.vmware)} vCenter connection(s)...")
+    for vc in config.vmware:
+        print(f"\n  vCenter: {vc.name}")
+        try:
+            with VMwareService(vc) as vmware:
+                vms = vmware.vm_client.get_all_vms()
+                print(f"  ✓ Connected - Found {len(vms)} VMs")
+        except Exception as e:
+            print(f"  ✗ Failed: {e}")
 
     print("\nTesting SMAX connection...")
     try:
@@ -1191,30 +1340,37 @@ def test_connections(config: AppConfig) -> None:
 
 
 def list_vmware_tags(config: AppConfig) -> None:
-    """List all VMware tags and categories"""
-    with VMwareService(config.vmware) as vmware:
-        print("\nTag Categories:")
-        print("-" * 40)
-        categories = vmware.tag_client.get_tag_categories()
-        for cat_id, cat_name in categories.items():
-            print(f"  - {cat_name}")
+    """List all VMware tags and categories from all vCenters"""
+    for vc in config.vmware:
+        print(f"\n{'=' * 50}")
+        print(f"vCenter: {vc.name}")
+        print("=" * 50)
+        try:
+            with VMwareService(vc) as vmware:
+                print("\nTag Categories:")
+                print("-" * 40)
+                categories = vmware.tag_client.get_tag_categories()
+                for cat_id, cat_name in categories.items():
+                    print(f"  - {cat_name}")
 
-        print("\nTags:")
-        print("-" * 40)
-        tags = vmware.tag_client.get_tags()
+                print("\nTags:")
+                print("-" * 40)
+                tags = vmware.tag_client.get_tags()
 
-        tags_by_category = {}
-        for tag_id, tag_data in tags.items():
-            cat_id = tag_data["category_id"]
-            cat_name = categories.get(cat_id, "Unknown")
-            if cat_name not in tags_by_category:
-                tags_by_category[cat_name] = []
-            tags_by_category[cat_name].append(tag_data["name"])
+                tags_by_category = {}
+                for tag_id, tag_data in tags.items():
+                    cat_id = tag_data["category_id"]
+                    cat_name = categories.get(cat_id, "Unknown")
+                    if cat_name not in tags_by_category:
+                        tags_by_category[cat_name] = []
+                    tags_by_category[cat_name].append(tag_data["name"])
 
-        for cat_name, tag_names in sorted(tags_by_category.items()):
-            print(f"\n  {cat_name}:")
-            for tag_name in sorted(tag_names):
-                print(f"    - {tag_name}")
+                for cat_name, tag_names in sorted(tags_by_category.items()):
+                    print(f"\n  {cat_name}:")
+                    for tag_name in sorted(tag_names):
+                        print(f"    - {tag_name}")
+        except Exception as e:
+            print(f"  ✗ Error: {e}")
 
 
 def run_sync_command(config: AppConfig, args) -> None:
@@ -1232,7 +1388,11 @@ def run_sync_command(config: AppConfig, args) -> None:
     if args.output:
         with open(args.output, "w") as f:
             json.dump(report.to_dict(), f, indent=2)
-        logger.info(f"Report saved to {args.output}")
+        logger.info(f"JSON report saved to {args.output}")
+
+    if hasattr(args, "report_file") and args.report_file:
+        report.save_to_file(args.report_file)
+        logger.info(f"Text report saved to {args.report_file}")
 
     if report.failed > 0:
         sys.exit(1)
@@ -1261,6 +1421,7 @@ Examples:
     sync_parser.add_argument("--dry-run", "-n", action="store_true", help="Perform a dry run without making changes")
     sync_parser.add_argument("--vms", nargs="+", help="Specific VM names to sync (default: all VMs)")
     sync_parser.add_argument("--output", "-o", help="Output file for sync report (JSON format)")
+    sync_parser.add_argument("--report-file", help="Save text report with untagged VMs list")
     sync_parser.add_argument("--verbose", "-v", action="store_true", help="Enable verbose logging")
     sync_parser.add_argument("--log-file", help="Log to file in addition to console")
 
