@@ -3,10 +3,13 @@
 VMware-SMAX Bridge
 Synchronizes VMware VM tags (UPN-based owners) with SMAX CI owners
 Uses pure REST API (no pyVmomi dependency)
+Supports multiple vCenters and Excel file as data sources
 
 Usage:
     python vmware_smax_bridge.py sync --config config.json
     python vmware_smax_bridge.py sync --config config.json --dry-run
+    python vmware_smax_bridge.py sync --config config.json --excel vms.xlsx
+    python vmware_smax_bridge.py sync --config config.json --excel-only vms.xlsx
     python vmware_smax_bridge.py test --config config.json
     python vmware_smax_bridge.py list-tags --config config.json
     python vmware_smax_bridge.py lookup-ci --config config.json --name "SERVER01"
@@ -21,6 +24,7 @@ import time
 from dataclasses import dataclass, field
 from datetime import datetime
 from enum import Enum
+from pathlib import Path
 from typing import Any, Dict, List, Optional
 
 import requests
@@ -31,7 +35,7 @@ from urllib3.util.retry import Retry
 # Disable SSL warnings globally
 urllib3.disable_warnings(urllib3.exceptions.InsecureRequestWarning)
 
-__version__ = "2.1.0"
+__version__ = "2.2.0"
 
 # =============================================================================
 # CONFIGURATION
@@ -161,6 +165,7 @@ class SyncReport:
     already_synced: int = 0
     results: List[SyncResult] = field(default_factory=list)
     vcenters_processed: List[str] = field(default_factory=list)
+    sources_processed: List[str] = field(default_factory=list)  # Includes vCenters + Excel files
 
     def add_result(self, result: SyncResult) -> None:
         """Add a sync result and update counters"""
@@ -189,6 +194,7 @@ class SyncReport:
             "end_time": self.end_time.isoformat() if self.end_time else None,
             "duration_seconds": (self.end_time - self.start_time).total_seconds() if self.end_time else None,
             "vcenters_processed": self.vcenters_processed,
+            "sources_processed": self.sources_processed,
             "summary": {
                 "total_vms": self.total_vms,
                 "synced": self.synced,
@@ -225,7 +231,9 @@ class SyncReport:
         if self.end_time:
             duration = (self.end_time - self.start_time).total_seconds()
             print(f"Duration: {duration:.2f} seconds")
-        if self.vcenters_processed:
+        if self.sources_processed:
+            print(f"Sources: {', '.join(self.sources_processed)}")
+        elif self.vcenters_processed:
             print(f"vCenters: {', '.join(self.vcenters_processed)}")
         print("-" * 60)
         print("Summary:")
@@ -243,8 +251,8 @@ class SyncReport:
             print("-" * 60)
             for r in self.results:
                 if r.status == SyncStatus.NO_OWNER_TAG:
-                    vc = f"[{r.vcenter}] " if r.vcenter else ""
-                    print(f"  {vc}{r.vm_name}")
+                    src = f"[{r.vcenter}] " if r.vcenter else ""
+                    print(f"  {src}{r.vm_name}")
             print("-" * 60)
         print("")
 
@@ -981,30 +989,178 @@ class SMAXService:
 
 
 # =============================================================================
+# EXCEL DATA SOURCE
+# =============================================================================
+
+
+def read_vm_owners_from_excel(excel_path: str, owner_category: str = "sorumlu") -> List[VMInfo]:
+    """
+    Read VM-owner mappings from Excel file and convert to VMInfo objects.
+    
+    Expected Excel columns:
+    - VM Name: The name of the VM
+    - Owner: The owner's UPN (e.g., z12345)
+    - Source (optional): Source identifier (default: 'excel')
+    - Power State (optional): POWERED_ON or POWERED_OFF
+    
+    Returns list of VMInfo objects compatible with sync operations.
+    """
+    try:
+        import openpyxl
+    except ImportError:
+        logger.error("openpyxl not installed. Run: pip install openpyxl")
+        return []
+
+    try:
+        wb = openpyxl.load_workbook(excel_path, read_only=True, data_only=True)
+        ws = wb.active
+
+        # Find column indices from header row
+        headers = {}
+        for col_idx, cell in enumerate(ws[1], 1):
+            if cell.value:
+                header_lower = str(cell.value).lower().strip()
+                if "vm" in header_lower and "name" in header_lower:
+                    headers["vm_name"] = col_idx
+                elif header_lower == "owner" or "owner" in header_lower:
+                    headers["owner"] = col_idx
+                elif header_lower == "source" or "vcenter" in header_lower:
+                    headers["source"] = col_idx
+                elif "power" in header_lower:
+                    headers["power_state"] = col_idx
+
+        if "vm_name" not in headers or "owner" not in headers:
+            logger.warning(f"Excel file missing required columns (VM Name, Owner). Found: {list(headers.keys())}")
+            return []
+
+        # Read data rows and convert to VMInfo
+        vm_list = []
+        for row in ws.iter_rows(min_row=2, values_only=True):
+            vm_name = row[headers["vm_name"] - 1] if headers["vm_name"] - 1 < len(row) else None
+            owner = row[headers["owner"] - 1] if headers["owner"] - 1 < len(row) else None
+            
+            source = "excel"
+            if "source" in headers and headers["source"] - 1 < len(row):
+                source = row[headers["source"] - 1] or "excel"
+            
+            power_state = "UNKNOWN"
+            if "power_state" in headers and headers["power_state"] - 1 < len(row):
+                power_state = row[headers["power_state"] - 1] or "UNKNOWN"
+
+            # Only include rows with both vm_name and owner
+            if vm_name and owner:
+                vm_name = str(vm_name).strip()
+                owner = str(owner).strip()
+                source = str(source).strip()
+                
+                # Create VMInfo with owner as a tag
+                vm_info = VMInfo(
+                    name=vm_name,
+                    uuid=f"excel-{vm_name}",  # Unique ID for Excel entries
+                    power_state=str(power_state),
+                    ip_address=None,
+                    tags={owner_category: [owner]},  # Put owner in the expected tag category
+                    guest_hostname=None,
+                    vcenter=source,
+                )
+                vm_list.append(vm_info)
+
+        wb.close()
+        logger.info(f"Read {len(vm_list)} VM-owner mappings from {excel_path}")
+        return vm_list
+
+    except Exception as e:
+        logger.error(f"Failed to read Excel file {excel_path}: {e}")
+        return []
+
+
+def merge_vm_lists(
+    vmware_vms: List[VMInfo], 
+    excel_vms: List[VMInfo],
+    excel_priority: bool = True
+) -> List[VMInfo]:
+    """
+    Merge VMware VMs with Excel VMs.
+    
+    Args:
+        vmware_vms: List of VMs from VMware vCenters
+        excel_vms: List of VMs from Excel
+        excel_priority: If True, Excel entries override VMware entries for same VM name
+    
+    Returns:
+        Merged list of VMInfo objects
+    """
+    if not excel_vms:
+        return vmware_vms
+    
+    if not vmware_vms:
+        return excel_vms
+    
+    # Create lookup by lowercase VM name
+    vm_map = {}
+    
+    # Add VMware VMs first
+    for vm in vmware_vms:
+        key = vm.name.lower()
+        vm_map[key] = vm
+    
+    # Add/override with Excel VMs
+    excel_overrides = 0
+    excel_new = 0
+    for vm in excel_vms:
+        key = vm.name.lower()
+        if key in vm_map:
+            if excel_priority:
+                # Excel overrides - but keep some VMware info if available
+                existing = vm_map[key]
+                vm.uuid = existing.uuid  # Keep VMware UUID
+                vm.ip_address = existing.ip_address
+                vm.guest_hostname = existing.guest_hostname
+                if existing.power_state != "UNKNOWN":
+                    vm.power_state = existing.power_state
+                vm_map[key] = vm
+                excel_overrides += 1
+        else:
+            vm_map[key] = vm
+            excel_new += 1
+    
+    if excel_overrides > 0:
+        logger.info(f"Excel overrode {excel_overrides} VMware entries")
+    if excel_new > 0:
+        logger.info(f"Excel added {excel_new} new VM entries not in VMware")
+    
+    return list(vm_map.values())
+
+
+# =============================================================================
 # SYNC SERVICE
 # =============================================================================
 
 
 class SyncService:
-    """Service to synchronize VMware VM tags with SMAX CI owners (multi-vCenter)"""
+    """Service to synchronize VMware VM tags with SMAX CI owners (multi-vCenter + Excel)"""
 
-    def __init__(self, config: AppConfig):
+    def __init__(self, config: AppConfig, excel_path: Optional[str] = None, excel_only: bool = False):
         self.config = config
-        self.vmware_service = MultiVMwareService(config.vmware)
+        self.excel_path = excel_path
+        self.excel_only = excel_only
+        self.vmware_service = None if excel_only else MultiVMwareService(config.vmware)
         self.smax_service = SMAXService(config.smax)
         self.sync_config = config.sync
 
     def connect(self) -> None:
         """Connect to all vCenters and SMAX"""
-        logger.info(f"Connecting to {len(self.config.vmware)} vCenter(s)...")
-        self.vmware_service.connect()
+        if self.vmware_service:
+            logger.info(f"Connecting to {len(self.config.vmware)} vCenter(s)...")
+            self.vmware_service.connect()
 
         logger.info("Connecting to SMAX...")
         self.smax_service.connect()
 
     def disconnect(self) -> None:
         """Disconnect from both services"""
-        self.vmware_service.disconnect()
+        if self.vmware_service:
+            self.vmware_service.disconnect()
         self.smax_service.disconnect()
 
     def sync_vm(self, vm: VMInfo) -> SyncResult:
@@ -1108,15 +1264,36 @@ class SyncService:
             )
 
     def sync_all(self) -> SyncReport:
-        """Sync all VMs from all vCenters to SMAX"""
+        """Sync all VMs from all sources (vCenters + Excel) to SMAX"""
         report = SyncReport(start_time=datetime.now())
-        report.vcenters_processed = self.vmware_service.get_vcenter_names()
-
-        logger.info("Retrieving VMs from all vCenters...")
-        vms = self.vmware_service.get_all_vms_with_tags()
+        
+        # Collect VMs from VMware vCenters
+        vmware_vms = []
+        if self.vmware_service:
+            report.vcenters_processed = self.vmware_service.get_vcenter_names()
+            logger.info("Retrieving VMs from all vCenters...")
+            vmware_vms = self.vmware_service.get_all_vms_with_tags()
+            logger.info(f"Retrieved {len(vmware_vms)} VMs from vCenters")
+        
+        # Collect VMs from Excel
+        excel_vms = []
+        if self.excel_path:
+            logger.info(f"Reading VMs from Excel: {self.excel_path}")
+            excel_vms = read_vm_owners_from_excel(
+                self.excel_path, 
+                self.sync_config.owner_tag_category
+            )
+        
+        # Build sources list for report
+        report.sources_processed = list(report.vcenters_processed)
+        if self.excel_path:
+            report.sources_processed.append(f"excel:{Path(self.excel_path).name}")
+        
+        # Merge VMware and Excel data
+        vms = merge_vm_lists(vmware_vms, excel_vms, excel_priority=True)
         report.total_vms = len(vms)
 
-        logger.info(f"Processing {len(vms)} VMs from {len(report.vcenters_processed)} vCenter(s)...")
+        logger.info(f"Processing {len(vms)} VMs from {len(report.sources_processed)} source(s)...")
 
         for i, vm in enumerate(vms, 1):
             if i % 50 == 0:
@@ -1149,11 +1326,30 @@ class SyncService:
         return report
 
     def sync_specific_vms(self, vm_names: List[str]) -> SyncReport:
-        """Sync specific VMs by name from all vCenters"""
+        """Sync specific VMs by name from all sources (vCenters + Excel)"""
         report = SyncReport(start_time=datetime.now())
-        report.vcenters_processed = self.vmware_service.get_vcenter_names()
-
-        all_vms = self.vmware_service.get_all_vms_with_tags()
+        
+        # Collect VMs from VMware vCenters
+        vmware_vms = []
+        if self.vmware_service:
+            report.vcenters_processed = self.vmware_service.get_vcenter_names()
+            vmware_vms = self.vmware_service.get_all_vms_with_tags()
+        
+        # Collect VMs from Excel
+        excel_vms = []
+        if self.excel_path:
+            excel_vms = read_vm_owners_from_excel(
+                self.excel_path,
+                self.sync_config.owner_tag_category
+            )
+        
+        # Build sources list for report
+        report.sources_processed = list(report.vcenters_processed)
+        if self.excel_path:
+            report.sources_processed.append(f"excel:{Path(self.excel_path).name}")
+        
+        # Merge VMware and Excel data
+        all_vms = merge_vm_lists(vmware_vms, excel_vms, excel_priority=True)
         
         # Case-insensitive matching
         vm_names_lower = [n.lower() for n in vm_names]
@@ -1163,7 +1359,7 @@ class SyncService:
         found_names = {vm.name for vm in vms}
         not_found = set(vm_names) - found_names
         if not_found:
-            logger.warning(f"VMs not found in any vCenter: {not_found}")
+            logger.warning(f"VMs not found in any source: {not_found}")
 
         if not vms:
             logger.warning("No VMs found to sync!")
@@ -1225,7 +1421,8 @@ def load_config_from_file(config_path: str) -> AppConfig:
     with open(config_path, "r") as f:
         data = json.load(f)
 
-    vmware_data = data.get("vmware", {})
+    # Support both "vmware" and "vcenters" keys for backward compatibility
+    vmware_data = data.get("vmware", data.get("vcenters", {}))
     smax_data = data.get("smax", {})
     sync_data = data.get("sync", {})
 
@@ -1416,7 +1613,15 @@ def lookup_smax_ci(config: AppConfig, ci_name: str) -> None:
 
 def run_sync_command(config: AppConfig, args) -> None:
     """Run the sync command"""
-    with SyncService(config) as service:
+    excel_path = getattr(args, "excel", None)
+    excel_only = getattr(args, "excel_only", False)
+    
+    # If excel_only is specified, use that path and set excel_only=True
+    if excel_only:
+        excel_path = excel_only
+        logger.info(f"Excel-only mode: using {excel_path}")
+    
+    with SyncService(config, excel_path=excel_path, excel_only=bool(excel_only)) as service:
         if args.vms:
             logger.info(f"Syncing specific VMs: {args.vms}")
             report = service.sync_specific_vms(args.vms)
@@ -1445,9 +1650,22 @@ def main():
         formatter_class=argparse.RawDescriptionHelpFormatter,
         epilog="""
 Examples:
+  # Sync from vCenters only
   python vmware_smax_bridge.py sync --config config.json
+
+  # Sync from vCenters + Excel (Excel takes precedence)
+  python vmware_smax_bridge.py sync --config config.json --excel vms.xlsx
+
+  # Sync from Excel only (no vCenter connection)
+  python vmware_smax_bridge.py sync --config config.json --excel-only vms.xlsx
+
+  # Dry run
   python vmware_smax_bridge.py sync --config config.json --dry-run
+
+  # Sync specific VMs
   python vmware_smax_bridge.py sync --config config.json --vms vm1 vm2
+
+  # Other commands
   python vmware_smax_bridge.py test --config config.json
   python vmware_smax_bridge.py list-tags --config config.json
   python vmware_smax_bridge.py lookup-ci --config config.json --name SERVER01
@@ -1462,6 +1680,8 @@ Examples:
     sync_parser.add_argument("--config", "-c", required=True, help="Path to configuration JSON file")
     sync_parser.add_argument("--dry-run", "-n", action="store_true", help="Perform a dry run without making changes")
     sync_parser.add_argument("--vms", nargs="+", help="Specific VM names to sync (default: all VMs)")
+    sync_parser.add_argument("--excel", "-e", help="Excel file with VM-owner mappings (merged with vCenter data)")
+    sync_parser.add_argument("--excel-only", help="Excel file with VM-owner mappings (no vCenter connection)")
     sync_parser.add_argument("--output", "-o", help="Output file for sync report (JSON format)")
     sync_parser.add_argument("--report-file", help="Save text report with untagged VMs list")
     sync_parser.add_argument("--verbose", "-v", action="store_true", help="Enable verbose logging")
