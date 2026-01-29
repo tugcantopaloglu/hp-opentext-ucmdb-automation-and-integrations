@@ -2,20 +2,20 @@
 """
 VMware-SMAX Bridge
 Synchronizes VMware VM tags (UPN-based owners) with SMAX CI owners
+Uses pure REST API (no pyVmomi dependency)
 
 Usage:
     python vmware_smax_bridge.py sync --config config.json
     python vmware_smax_bridge.py sync --config config.json --dry-run
     python vmware_smax_bridge.py test --config config.json
     python vmware_smax_bridge.py list-tags --config config.json
+    python vmware_smax_bridge.py lookup-ci --config config.json --name "SERVER01"
     python vmware_smax_bridge.py generate-config --output config.json
 """
 
 import argparse
-import atexit
 import json
 import logging
-import ssl
 import sys
 import time
 from dataclasses import dataclass, field
@@ -24,16 +24,19 @@ from enum import Enum
 from typing import Any, Dict, List, Optional
 
 import requests
-from pyVim.connect import Disconnect, SmartConnect
-from pyVmomi import vim
+import urllib3
 from requests.adapters import HTTPAdapter
 from urllib3.util.retry import Retry
 
-__version__ = "2.0.0"
+# Disable SSL warnings globally
+urllib3.disable_warnings(urllib3.exceptions.InsecureRequestWarning)
+
+__version__ = "2.1.0"
 
 # =============================================================================
 # CONFIGURATION
 # =============================================================================
+
 
 @dataclass
 class VMwareConfig:
@@ -63,11 +66,12 @@ class SMAXConfig:
 @dataclass
 class SyncConfig:
     """Synchronization configuration"""
-    owner_tag_category: str = "Owner"
+    owner_tag_category: str = "sorumlu"
     smax_owner_field: str = "OwnedByPerson"
     smax_ci_type: str = "Device"
+    smax_ci_subtype: Optional[str] = "Server"
     smax_matching_field: str = "DisplayLabel"
-    smax_alt_matching_field: Optional[str] = "PrimaryIP"
+    smax_alt_matching_field: Optional[str] = "HostName"
     dry_run: bool = False
     batch_size: int = 50
 
@@ -83,6 +87,7 @@ class AppConfig:
 # =============================================================================
 # DATA MODELS
 # =============================================================================
+
 
 @dataclass
 class VMInfo:
@@ -108,8 +113,7 @@ class CIRecord:
     display_label: str
     ci_type: str
     owner: Optional[str] = None
-    primary_ip: Optional[str] = None
-    dns_name: Optional[str] = None
+    hostname: Optional[str] = None
     properties: Dict[str, Any] = None
 
     def __post_init__(self):
@@ -284,80 +288,71 @@ class SyncReport:
 
 
 # =============================================================================
-# VMWARE CLIENT
+# VMWARE CLIENT (REST API ONLY - NO pyVmomi)
 # =============================================================================
 
 logger = logging.getLogger(__name__)
 
 
 class VMwareClient:
-    """Client for interacting with VMware vCenter"""
+    """Client for interacting with VMware vCenter via REST API"""
 
     def __init__(self, config: VMwareConfig):
         self.config = config
-        self.service_instance = None
-        self.content = None
+        self.session = None
+        self.base_url = f"https://{config.host}/api"
+        self._session_id = None
 
     def connect(self) -> None:
-        """Establish connection to vCenter"""
-        try:
-            context = None
-            if self.config.disable_ssl_verification:
-                context = ssl.SSLContext(ssl.PROTOCOL_TLS_CLIENT)
-                context.check_hostname = False
-                context.verify_mode = ssl.CERT_NONE
+        """Establish connection to vCenter REST API"""
+        from requests.auth import HTTPBasicAuth
 
-            self.service_instance = SmartConnect(
-                host=self.config.host,
-                user=self.config.username,
-                pwd=self.config.password,
-                port=self.config.port,
-                sslContext=context,
-            )
+        self.session = requests.Session()
+        self.session.verify = not self.config.disable_ssl_verification
 
-            atexit.register(Disconnect, self.service_instance)
-            self.content = self.service_instance.RetrieveContent()
-            logger.info(f"Successfully connected to vCenter: {self.config.host}")
+        auth_url = f"{self.base_url}/session"
+        response = self.session.post(
+            auth_url, auth=HTTPBasicAuth(self.config.username, self.config.password)
+        )
+        response.raise_for_status()
 
-        except Exception as e:
-            logger.error(f"Failed to connect to vCenter: {e}")
-            raise
+        self._session_id = response.json()
+        self.session.headers.update({"vmware-api-session-id": self._session_id})
+
+        logger.info(f"Successfully connected to vCenter: {self.config.host}")
 
     def disconnect(self) -> None:
         """Disconnect from vCenter"""
-        if self.service_instance:
-            Disconnect(self.service_instance)
-            logger.info("Disconnected from vCenter")
+        if self.session and self._session_id:
+            try:
+                self.session.delete(f"{self.base_url}/session")
+            except Exception as e:
+                logger.warning(f"Failed to close session: {e}")
+            logger.info(f"Disconnected from vCenter: {self.config.name}")
 
-    def get_all_vms(self) -> List[vim.VirtualMachine]:
-        """Retrieve all virtual machines from vCenter"""
-        container = self.content.viewManager.CreateContainerView(
-            self.content.rootFolder, [vim.VirtualMachine], True
-        )
-        vms = list(container.view)
-        container.Destroy()
+    def get_all_vms(self) -> List[Dict[str, Any]]:
+        """Retrieve all virtual machines from vCenter via REST API"""
+        response = self.session.get(f"{self.base_url}/vcenter/vm")
+        response.raise_for_status()
+
+        vms = response.json()
         logger.info(f"Retrieved {len(vms)} virtual machines")
         return vms
 
-    def get_vm_info(self, vm: vim.VirtualMachine) -> VMInfo:
-        """Extract relevant information from a VM object"""
-        ip_address = None
-        if vm.guest and vm.guest.ipAddress:
-            ip_address = vm.guest.ipAddress
-
-        hostname = None
-        if vm.guest and vm.guest.hostName:
-            hostname = vm.guest.hostName
-
-        power_state = str(vm.runtime.powerState)
+    def get_vm_info(self, vm_data: Dict[str, Any]) -> VMInfo:
+        """Extract relevant information from a VM API response"""
+        vm_id = vm_data.get("vm", "")
+        name = vm_data.get("name", "")
+        power_state = vm_data.get("power_state", "UNKNOWN")
 
         return VMInfo(
-            name=vm.name,
-            uuid=vm.config.uuid if vm.config else "",
+            name=name,
+            uuid=vm_id,
             power_state=power_state,
-            ip_address=ip_address,
+            ip_address=None,
             tags={},
-            guest_hostname=hostname,
+            guest_hostname=None,
+            vcenter=self.config.name,
         )
 
     def get_all_vms_with_info(self) -> List[VMInfo]:
@@ -365,12 +360,12 @@ class VMwareClient:
         vms = self.get_all_vms()
         vm_infos = []
 
-        for vm in vms:
+        for vm_data in vms:
             try:
-                info = self.get_vm_info(vm)
+                info = self.get_vm_info(vm_data)
                 vm_infos.append(info)
             except Exception as e:
-                logger.warning(f"Failed to get info for VM: {e}")
+                logger.warning(f"Failed to get info for VM {vm_data.get('name', 'unknown')}: {e}")
                 continue
 
         return vm_infos
@@ -388,10 +383,6 @@ class VMwareTagClient:
     def connect(self) -> None:
         """Authenticate and create session"""
         from requests.auth import HTTPBasicAuth
-
-        if self.config.disable_ssl_verification:
-            import urllib3
-            urllib3.disable_warnings(urllib3.exceptions.InsecureRequestWarning)
 
         self.session = requests.Session()
         self.session.verify = not self.config.disable_ssl_verification
@@ -578,7 +569,7 @@ class MultiVMwareService:
 
 
 # =============================================================================
-# SMAX CLIENT
+# SMAX CLIENT (WITH ALL FIXES)
 # =============================================================================
 
 
@@ -595,6 +586,7 @@ class SMAXClient:
     def _create_session(self) -> requests.Session:
         """Create a session with retry logic"""
         session = requests.Session()
+        session.verify = False  # Disable SSL verification for SMAX
 
         retry_strategy = Retry(
             total=3,
@@ -625,7 +617,8 @@ class SMAXClient:
 
     def _authenticate(self) -> None:
         """Authenticate using username and password"""
-        auth_url = f"{self.config.base_url}/auth/authentication-endpoint/authenticate/login"
+        # Use token endpoint (not login endpoint)
+        auth_url = f"{self.config.base_url}/auth/authentication-endpoint/authenticate/token?TENANTID={self.config.tenant_id}"
 
         payload = {"Login": self.config.username, "Password": self.config.password}
         headers = {"Content-Type": "application/json"}
@@ -633,10 +626,8 @@ class SMAXClient:
         response = self.session.post(auth_url, json=payload, headers=headers)
         response.raise_for_status()
 
-        self._token = response.cookies.get("LWSSO_COOKIE_KEY")
-        if not self._token:
-            data = response.json()
-            self._token = data.get("token")
+        # Token is returned as plain text
+        self._token = response.text.strip().strip('"')
 
         if not self._token:
             raise Exception("Failed to obtain authentication token from SMAX")
@@ -664,9 +655,10 @@ class SMAXClient:
         self._ensure_authenticated()
 
         url = f"{self.base_url}/ems/{ci_type}"
+        # FIXED: Use correct field names and parentheses in filter
         params = {
-            "layout": "Id,DisplayLabel,OwnedByPerson,PrimaryIP,DnsName",
-            "filter": f"DisplayLabel = '{self._escape_query(name)}'",
+            "layout": "Id,DisplayLabel,HostName,OwnedByPerson,PhaseId,SubType",
+            "filter": f"(DisplayLabel = '{self._escape_query(name)}')",
         }
 
         response = self.session.get(url, params=params)
@@ -684,21 +676,21 @@ class SMAXClient:
                     display_label=props.get("DisplayLabel", ""),
                     ci_type=ci_type,
                     owner=props.get("OwnedByPerson"),
-                    primary_ip=props.get("PrimaryIP"),
-                    dns_name=props.get("DnsName"),
+                    hostname=props.get("HostName"),
                     properties=props,
                 )
 
         return None
 
-    def get_ci_by_ip(self, ip_address: str, ci_type: str = "Device") -> Optional[CIRecord]:
-        """Search for a CI by its IP address"""
+    def get_ci_by_hostname(self, hostname: str, ci_type: str = "Device") -> Optional[CIRecord]:
+        """Search for a CI by its hostname"""
         self._ensure_authenticated()
 
         url = f"{self.base_url}/ems/{ci_type}"
+        # FIXED: Use HostName field with parentheses
         params = {
-            "layout": "Id,DisplayLabel,OwnedByPerson,PrimaryIP,DnsName",
-            "filter": f"PrimaryIP = '{self._escape_query(ip_address)}'",
+            "layout": "Id,DisplayLabel,HostName,OwnedByPerson,PhaseId,SubType",
+            "filter": f"(HostName = '{self._escape_query(hostname)}')",
         }
 
         response = self.session.get(url, params=params)
@@ -716,8 +708,7 @@ class SMAXClient:
                     display_label=props.get("DisplayLabel", ""),
                     ci_type=ci_type,
                     owner=props.get("OwnedByPerson"),
-                    primary_ip=props.get("PrimaryIP"),
-                    dns_name=props.get("DnsName"),
+                    hostname=props.get("HostName"),
                     properties=props,
                 )
 
@@ -727,7 +718,7 @@ class SMAXClient:
         self,
         ci_type: str = "Device",
         filter_query: Optional[str] = None,
-        layout: str = "Id,DisplayLabel,OwnedByPerson,PrimaryIP,DnsName",
+        layout: str = "Id,DisplayLabel,HostName,OwnedByPerson,PhaseId,SubType",
         skip: int = 0,
         size: int = 100,
     ) -> List[CIRecord]:
@@ -741,7 +732,10 @@ class SMAXClient:
             params["filter"] = filter_query
 
         response = self.session.get(url, params=params)
-        response.raise_for_status()
+
+        if not response.ok:
+            logger.error(f"CI search failed: {response.status_code}")
+            return []
 
         data = response.json()
         entities = data.get("entities", [])
@@ -755,22 +749,27 @@ class SMAXClient:
                     display_label=props.get("DisplayLabel", ""),
                     ci_type=ci_type,
                     owner=props.get("OwnedByPerson"),
-                    primary_ip=props.get("PrimaryIP"),
-                    dns_name=props.get("DnsName"),
+                    hostname=props.get("HostName"),
                     properties=props,
                 )
             )
 
         return cis
 
-    def get_all_cis(self, ci_type: str = "Device") -> List[CIRecord]:
+    def get_all_cis(self, ci_type: str = "Device", subtype_filter: Optional[str] = None) -> List[CIRecord]:
         """Get all CIs of a specific type (handles pagination)"""
         all_cis = []
         skip = 0
         size = 100
 
+        # FIXED: Build filter with parentheses
+        filter_query = None
+        if subtype_filter:
+            filter_query = f"(SubType = '{subtype_filter}')"
+            logger.info(f"Using subtype filter: {subtype_filter}")
+
         while True:
-            batch = self.search_cis(ci_type=ci_type, skip=skip, size=size)
+            batch = self.search_cis(ci_type=ci_type, filter_query=filter_query, skip=skip, size=size)
             if not batch:
                 break
 
@@ -781,6 +780,13 @@ class SMAXClient:
 
             skip += size
 
+            if skip > 50000:
+                logger.warning("Reached 50,000 CIs limit, stopping pagination")
+                break
+
+            if skip % 1000 == 0:
+                logger.info(f"Loaded {skip} CIs so far...")
+
         logger.info(f"Retrieved {len(all_cis)} CIs of type {ci_type}")
         return all_cis
 
@@ -790,10 +796,10 @@ class SMAXClient:
 
         url = f"{self.base_url}/ems/Person"
 
-        # Try exact match first
+        # FIXED: Use correct field names and parentheses
         params = {
-            "layout": "Id,Name,Email,Upn",
-            "filter": f"Upn = '{self._escape_query(upn)}'",
+            "layout": "Id,Upn",
+            "filter": f"(Upn = '{self._escape_query(upn)}')",
         }
 
         response = self.session.get(url, params=params)
@@ -806,32 +812,10 @@ class SMAXClient:
                 props = entities[0].get("properties", {})
                 return str(props.get("Id"))
 
-        # If not found, try partial match (in case UPN has domain suffix)
+        # If not found, try partial match
         params = {
-            "layout": "Id,Name,Email,Upn",
-            "filter": f"Upn like '{self._escape_query(upn)}%'",
-        }
-
-        response = self.session.get(url, params=params)
-
-        if response.ok:
-            data = response.json()
-            entities = data.get("entities", [])
-
-            if entities:
-                props = entities[0].get("properties", {})
-                return str(props.get("Id"))
-
-        return None
-
-    def get_person_by_name(self, name: str) -> Optional[str]:
-        """Find a person by name and return their ID"""
-        self._ensure_authenticated()
-
-        url = f"{self.base_url}/ems/Person"
-        params = {
-            "layout": "Id,Name,Email,Upn",
-            "filter": f"Name = '{self._escape_query(name)}'",
+            "layout": "Id,Upn",
+            "filter": f"(Upn like '{self._escape_query(upn)}%')",
         }
 
         response = self.session.get(url, params=params)
@@ -846,36 +830,36 @@ class SMAXClient:
 
         return None
 
-    def search_person(self, search_term: str) -> List[Dict[str, Any]]:
-        """Search for persons by name, email, or UPN"""
+    def get_person_by_id(self, person_id: str) -> Optional[Dict[str, Any]]:
+        """Get a person's details by their ID"""
         self._ensure_authenticated()
 
         url = f"{self.base_url}/ems/Person"
         params = {
-            "layout": "Id,Name,Email,Upn",
-            "filter": f"Name like '%{self._escape_query(search_term)}%' or Email like '%{self._escape_query(search_term)}%' or Upn like '%{self._escape_query(search_term)}%'",
+            "layout": "Id,Upn",
+            "filter": f"(Id = {person_id})",
+            "size": 1,
         }
 
         response = self.session.get(url, params=params)
 
         if response.ok:
             data = response.json()
-            return [
-                {
-                    "id": e.get("properties", {}).get("Id"),
-                    "name": e.get("properties", {}).get("Name"),
-                    "email": e.get("properties", {}).get("Email"),
-                    "upn": e.get("properties", {}).get("Upn"),
+            entities = data.get("entities", [])
+
+            if entities:
+                props = entities[0].get("properties", {})
+                return {
+                    "id": str(props.get("Id")),
+                    "upn": props.get("Upn"),
                 }
-                for e in data.get("entities", [])
-            ]
 
-        return []
+        return None
 
     def update_ci_owner(
         self, ci_id: str, owner_id: str, owner_field: str = "OwnedByPerson"
     ) -> bool:
-        """Update the owner of a CI"""
+        """Update the owner of a CI using bulk update endpoint"""
         self._ensure_authenticated()
 
         parts = ci_id.split("/")
@@ -885,20 +869,38 @@ class SMAXClient:
 
         ci_type, record_id = parts
 
-        url = f"{self.base_url}/ems/{ci_type}/{record_id}"
+        # FIXED: Use POST to /ems/bulk with operation UPDATE (not PUT)
+        url = f"{self.base_url}/ems/bulk"
+        payload = {
+            "entities": [
+                {
+                    "entity_type": ci_type,
+                    "properties": {
+                        "Id": record_id,
+                        owner_field: owner_id
+                    }
+                }
+            ],
+            "operation": "UPDATE"
+        }
 
-        payload = {"entity_type": ci_type, "properties": {owner_field: owner_id}}
-
-        response = self.session.put(url, json=payload)
+        logger.debug(f"Updating CI via bulk endpoint: {url}")
+        response = self.session.post(url, json=payload)
 
         if response.ok:
-            logger.info(f"Successfully updated owner for CI {ci_id}")
-            return True
-        else:
-            logger.error(
-                f"Failed to update CI {ci_id}: {response.status_code} - {response.text}"
-            )
-            return False
+            data = response.json()
+            results = data.get("entity_result_list", [])
+            if results and results[0].get("completion_status") == "OK":
+                logger.info(f"Successfully updated owner for CI {ci_id}")
+                return True
+            else:
+                logger.error(f"Bulk update returned unexpected result: {data}")
+                return False
+
+        logger.error(
+            f"Failed to update CI {ci_id}: {response.status_code} - {response.text[:300]}"
+        )
+        return False
 
     def disconnect(self) -> None:
         """Close the session"""
@@ -933,18 +935,8 @@ class SMAXService:
         if owner_identifier in self._person_cache:
             return self._person_cache[owner_identifier]
 
-        # Primary: Try by UPN (e.g., z12345)
+        # Try by UPN (e.g., z12345)
         person_id = self.client.get_person_by_upn(owner_identifier)
-
-        if not person_id:
-            # Fallback: Try by Name
-            person_id = self.client.get_person_by_name(owner_identifier)
-
-        if not person_id:
-            # Last resort: Search with partial match
-            persons = self.client.search_person(owner_identifier)
-            if persons:
-                person_id = str(persons[0]["id"])
 
         self._person_cache[owner_identifier] = person_id
         return person_id
@@ -952,29 +944,31 @@ class SMAXService:
     def find_ci_for_vm(
         self, vm_name: str, vm_ip: Optional[str] = None, ci_type: str = "Device"
     ) -> Optional[CIRecord]:
-        """Find a CI that matches a VM by name or IP"""
+        """Find a CI that matches a VM by name or hostname"""
         cache_key = f"{vm_name}:{vm_ip}"
         if cache_key in self._ci_cache:
             return self._ci_cache[cache_key]
 
+        # Try by DisplayLabel first
         ci = self.client.get_ci_by_name(vm_name, ci_type)
 
-        if not ci and vm_ip:
-            ci = self.client.get_ci_by_ip(vm_ip, ci_type)
+        # Fallback to HostName
+        if not ci:
+            ci = self.client.get_ci_by_hostname(vm_name, ci_type)
 
         if ci:
             self._ci_cache[cache_key] = ci
 
         return ci
 
-    def load_all_cis(self, ci_type: str = "Device") -> None:
+    def load_all_cis(self, ci_type: str = "Device", subtype_filter: Optional[str] = None) -> None:
         """Pre-load all CIs into cache for faster lookups"""
-        cis = self.client.get_all_cis(ci_type)
+        cis = self.client.get_all_cis(ci_type, subtype_filter)
 
         for ci in cis:
             self._ci_cache[ci.display_label] = ci
-            if ci.primary_ip:
-                self._ci_cache[ci.primary_ip] = ci
+            if ci.hostname:
+                self._ci_cache[ci.hostname] = ci
 
         logger.info(f"Loaded {len(cis)} CIs into cache")
 
@@ -1008,9 +1002,6 @@ class SyncService:
         logger.info("Connecting to SMAX...")
         self.smax_service.connect()
 
-        logger.info("Loading CIs from SMAX...")
-        self.smax_service.load_all_cis(self.sync_config.smax_ci_type)
-
     def disconnect(self) -> None:
         """Disconnect from both services"""
         self.vmware_service.disconnect()
@@ -1040,7 +1031,7 @@ class SyncService:
                 vm_name=vm.name,
                 vm_uuid=vm.uuid,
                 status=SyncStatus.NOT_FOUND,
-                message=f"No CI found in SMAX matching VM name '{vm.name}' or IP '{vm.ip_address}'",
+                message=f"No CI found in SMAX matching VM name '{vm.name}'",
                 owner_tag=owner_tag,
                 vcenter=vm.vcenter,
             )
@@ -1058,7 +1049,8 @@ class SyncService:
                 vcenter=vm.vcenter,
             )
 
-        if ci.owner == owner_id:
+        # Compare as strings (owner might be int or string)
+        if str(ci.owner) == str(owner_id):
             return SyncResult(
                 vm_name=vm.name,
                 vm_uuid=vm.uuid,
@@ -1067,7 +1059,7 @@ class SyncService:
                 owner_tag=owner_tag,
                 resolved_owner_id=owner_id,
                 ci_id=ci.id,
-                previous_owner=ci.owner,
+                previous_owner=str(ci.owner) if ci.owner else None,
                 vcenter=vm.vcenter,
             )
 
@@ -1080,7 +1072,7 @@ class SyncService:
                 owner_tag=owner_tag,
                 resolved_owner_id=owner_id,
                 ci_id=ci.id,
-                previous_owner=ci.owner,
+                previous_owner=str(ci.owner) if ci.owner else None,
                 vcenter=vm.vcenter,
             )
 
@@ -1099,7 +1091,7 @@ class SyncService:
                 owner_tag=owner_tag,
                 resolved_owner_id=owner_id,
                 ci_id=ci.id,
-                previous_owner=ci.owner,
+                previous_owner=str(ci.owner) if ci.owner else None,
                 vcenter=vm.vcenter,
             )
         else:
@@ -1111,7 +1103,7 @@ class SyncService:
                 owner_tag=owner_tag,
                 resolved_owner_id=owner_id,
                 ci_id=ci.id,
-                previous_owner=ci.owner,
+                previous_owner=str(ci.owner) if ci.owner else None,
                 vcenter=vm.vcenter,
             )
 
@@ -1162,7 +1154,10 @@ class SyncService:
         report.vcenters_processed = self.vmware_service.get_vcenter_names()
 
         all_vms = self.vmware_service.get_all_vms_with_tags()
-        vms = [vm for vm in all_vms if vm.name in vm_names]
+        
+        # Case-insensitive matching
+        vm_names_lower = [n.lower() for n in vm_names]
+        vms = [vm for vm in all_vms if vm.name.lower() in vm_names_lower]
         report.total_vms = len(vms)
 
         found_names = {vm.name for vm in vms}
@@ -1170,10 +1165,17 @@ class SyncService:
         if not_found:
             logger.warning(f"VMs not found in any vCenter: {not_found}")
 
-        for vm in vms:
+        if not vms:
+            logger.warning("No VMs found to sync!")
+            report.finalize()
+            return report
+
+        for i, vm in enumerate(vms, 1):
+            logger.info(f"Processing VM {i}/{len(vms)}: {vm.name} ({vm.vcenter})")
             try:
                 result = self.sync_vm(vm)
                 report.add_result(result)
+                logger.info(f"  Result: {result.status.value} - {result.message}")
             except Exception as e:
                 logger.error(f"Error processing VM {vm.name}: {e}")
                 report.add_result(
@@ -1261,11 +1263,12 @@ def load_config_from_file(config_path: str) -> AppConfig:
             api_token=smax_data.get("api_token"),
         ),
         sync=SyncConfig(
-            owner_tag_category=sync_data.get("owner_tag_category", "Owner"),
+            owner_tag_category=sync_data.get("owner_tag_category", "sorumlu"),
             smax_owner_field=sync_data.get("smax_owner_field", "OwnedByPerson"),
             smax_ci_type=sync_data.get("smax_ci_type", "Device"),
+            smax_ci_subtype=sync_data.get("smax_ci_subtype", "Server"),
             smax_matching_field=sync_data.get("smax_matching_field", "DisplayLabel"),
-            smax_alt_matching_field=sync_data.get("smax_alt_matching_field", "PrimaryIP"),
+            smax_alt_matching_field=sync_data.get("smax_alt_matching_field", "HostName"),
             dry_run=sync_data.get("dry_run", False),
             batch_size=sync_data.get("batch_size", 50),
         ),
@@ -1282,7 +1285,7 @@ def generate_config_template(output_path: str) -> None:
                 "username": "administrator@vsphere.local",
                 "password": "your-password",
                 "port": 443,
-                "disable_ssl_verification": False,
+                "disable_ssl_verification": True,
             },
             {
                 "name": "vcenter-dev",
@@ -1290,7 +1293,7 @@ def generate_config_template(output_path: str) -> None:
                 "username": "administrator@vsphere.local",
                 "password": "your-password",
                 "port": 443,
-                "disable_ssl_verification": False,
+                "disable_ssl_verification": True,
             },
         ],
         "smax": {
@@ -1301,11 +1304,12 @@ def generate_config_template(output_path: str) -> None:
             "api_token": None,
         },
         "sync": {
-            "owner_tag_category": "Owner",
+            "owner_tag_category": "sorumlu",
             "smax_owner_field": "OwnedByPerson",
             "smax_ci_type": "Device",
+            "smax_ci_subtype": "Server",
             "smax_matching_field": "DisplayLabel",
-            "smax_alt_matching_field": "PrimaryIP",
+            "smax_alt_matching_field": "HostName",
             "dry_run": False,
             "batch_size": 50,
         },
@@ -1373,6 +1377,43 @@ def list_vmware_tags(config: AppConfig) -> None:
             print(f"  ✗ Error: {e}")
 
 
+def lookup_smax_ci(config: AppConfig, ci_name: str) -> None:
+    """Look up a specific CI by name and show all fields"""
+    print(f"\nLooking up CI: {ci_name}")
+    print("-" * 40)
+
+    with SMAXService(config.smax) as smax:
+        ci = smax.client.get_ci_by_name(ci_name, config.sync.smax_ci_type)
+
+        if not ci:
+            ci = smax.client.get_ci_by_hostname(ci_name, config.sync.smax_ci_type)
+
+        if ci:
+            print(f"✓ Found CI: {ci.display_label}")
+            print(f"  CI ID: {ci.id}")
+            print(f"  CI Type: {ci.ci_type}")
+            print(f"  Owner ID: {ci.owner}")
+
+            # Look up owner's UPN
+            if ci.owner:
+                person = smax.client.get_person_by_id(str(ci.owner))
+                if person:
+                    print(f"  Owner UPN: {person.get('upn')}")
+                else:
+                    print(f"  Owner: (could not resolve Person ID {ci.owner})")
+            else:
+                print(f"  Owner: (none)")
+
+            print(f"  HostName: {ci.hostname}")
+
+            if ci.properties:
+                print(f"\n  All properties:")
+                for k, v in sorted(ci.properties.items()):
+                    print(f"    {k}: {v}")
+        else:
+            print(f"✗ CI not found: {ci_name}")
+
+
 def run_sync_command(config: AppConfig, args) -> None:
     """Run the sync command"""
     with SyncService(config) as service:
@@ -1400,7 +1441,7 @@ def run_sync_command(config: AppConfig, args) -> None:
 
 def main():
     parser = argparse.ArgumentParser(
-        description="VMware-SMAX Bridge: Sync VM tags to CI owners",
+        description="VMware-SMAX Bridge: Sync VM tags to CI owners (REST API only)",
         formatter_class=argparse.RawDescriptionHelpFormatter,
         epilog="""
 Examples:
@@ -1409,6 +1450,7 @@ Examples:
   python vmware_smax_bridge.py sync --config config.json --vms vm1 vm2
   python vmware_smax_bridge.py test --config config.json
   python vmware_smax_bridge.py list-tags --config config.json
+  python vmware_smax_bridge.py lookup-ci --config config.json --name SERVER01
   python vmware_smax_bridge.py generate-config --output config.json
         """,
     )
@@ -1434,6 +1476,12 @@ Examples:
     tags_parser = subparsers.add_parser("list-tags", help="List all VMware tags and categories")
     tags_parser.add_argument("--config", "-c", required=True, help="Path to configuration JSON file")
     tags_parser.add_argument("--verbose", "-v", action="store_true", help="Enable verbose logging")
+
+    # Lookup CI command
+    lookup_parser = subparsers.add_parser("lookup-ci", help="Look up a CI in SMAX")
+    lookup_parser.add_argument("--config", "-c", required=True, help="Path to configuration JSON file")
+    lookup_parser.add_argument("--name", "-n", required=True, help="CI name to look up")
+    lookup_parser.add_argument("--verbose", "-v", action="store_true", help="Enable verbose logging")
 
     # Generate config command
     template_parser = subparsers.add_parser("generate-config", help="Generate a config template")
@@ -1467,6 +1515,8 @@ Examples:
         test_connections(config)
     elif args.command == "list-tags":
         list_vmware_tags(config)
+    elif args.command == "lookup-ci":
+        lookup_smax_ci(config, args.name)
     elif args.command == "sync":
         run_sync_command(config, args)
 
