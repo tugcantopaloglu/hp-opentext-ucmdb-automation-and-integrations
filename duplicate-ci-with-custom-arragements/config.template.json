@@ -1,0 +1,27 @@
+{
+  "ucmdb": {
+    "base_url": "https://ucmdb-server:8443/rest-api",
+    "username": "admin",
+    "password": "your-password",
+    "client_context": 1,
+    "disable_ssl_verification": true
+  },
+  "smax": {
+    "base_url": "https://smax.example.com",
+    "tenant_id": "your-tenant-id",
+    "username": "admin",
+    "password": "your-password",
+    "api_token": null
+  },
+  "merge": {
+    "ci_type": "node",
+    "smax_ci_type": "Device",
+    "smax_created_by_marker": "Updated-By-SMAX",
+    "name_property": "name",
+    "network_type_property": "_NetworkType",
+    "skip_relation_types": [],
+    "skip_composition_children": true,
+    "dry_run": false,
+    "batch_size": 50
+  }
+}
