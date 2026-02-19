@@ -1,0 +1,5 @@
+# AD Network Change & Check Fix dependencies
+
+ldap3>=2.9.0
+requests>=2.28.0
+urllib3>=1.26.0
