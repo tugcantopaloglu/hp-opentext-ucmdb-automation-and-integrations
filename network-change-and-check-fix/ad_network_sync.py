@@ -102,13 +102,6 @@ class ADComputer:
     """Represents an Active Directory computer object"""
     name: str
     distinguished_name: str
-    dns_hostname: Optional[str] = None
-    operating_system: Optional[str] = None
-    when_changed: Optional[str] = None
-    when_created: Optional[str] = None
-    ip_addresses: List[str] = field(default_factory=list)
-    description: Optional[str] = None
-    enabled: bool = True
 
 
 @dataclass
@@ -360,12 +353,8 @@ class ADClient:
         attributes = [
             "cn",
             "distinguishedName",
-            "dNSHostName",
-            "operatingSystem",
             "whenChanged",
             "whenCreated",
-            "description",
-            "userAccountControl",
         ]
 
         computers = []
@@ -402,53 +391,9 @@ class ADClient:
         if isinstance(dn, list):
             dn = dn[0] if dn else ""
 
-        dns_hostname = attrs.get("dNSHostName", None)
-        if isinstance(dns_hostname, list):
-            dns_hostname = dns_hostname[0] if dns_hostname else None
-
-        os_name = attrs.get("operatingSystem", None)
-        if isinstance(os_name, list):
-            os_name = os_name[0] if os_name else None
-
-        when_changed = attrs.get("whenChanged", None)
-        if isinstance(when_changed, list):
-            when_changed = when_changed[0] if when_changed else None
-        if isinstance(when_changed, datetime):
-            when_changed = when_changed.isoformat()
-        elif when_changed:
-            when_changed = str(when_changed)
-
-        when_created = attrs.get("whenCreated", None)
-        if isinstance(when_created, list):
-            when_created = when_created[0] if when_created else None
-        if isinstance(when_created, datetime):
-            when_created = when_created.isoformat()
-        elif when_created:
-            when_created = str(when_created)
-
-        description = attrs.get("description", None)
-        if isinstance(description, list):
-            description = description[0] if description else None
-
-        uac = attrs.get("userAccountControl", 0)
-        if isinstance(uac, list):
-            uac = uac[0] if uac else 0
-        try:
-            uac = int(uac)
-        except (ValueError, TypeError):
-            uac = 0
-        enabled = not bool(uac & 0x0002)
-
         return ADComputer(
             name=name,
             distinguished_name=dn,
-            dns_hostname=dns_hostname,
-            operating_system=os_name,
-            when_changed=when_changed,
-            when_created=when_created,
-            ip_addresses=[],
-            description=description,
-            enabled=enabled,
         )
 
     def __enter__(self):
@@ -492,22 +437,9 @@ def read_computers_from_csv(
                     if not matched:
                         continue
 
-                ip_str = row.get("IPAddresses", "")
-                ip_addresses = [ip.strip() for ip in ip_str.split(";") if ip.strip()]
-
-                enabled_str = row.get("Enabled", "True").strip()
-                enabled = enabled_str.lower() in ("true", "1", "yes")
-
                 computers.append(ADComputer(
                     name=name,
                     distinguished_name=row.get("DistinguishedName", ""),
-                    dns_hostname=row.get("DNSHostName") or None,
-                    operating_system=row.get("OperatingSystem") or None,
-                    when_changed=row.get("WhenChanged") or None,
-                    when_created=row.get("WhenCreated") or None,
-                    ip_addresses=ip_addresses,
-                    description=row.get("Description") or None,
-                    enabled=enabled,
                 ))
 
         logger.info(f"Read {len(computers)} computers from CSV: {path}")
@@ -970,12 +902,8 @@ class NetworkSyncService:
         5. If dry_run -> SKIPPED
         6. Else -> update and return SUCCESS or FAILED
         """
-        # Get first IP if available
-        ip = computer.ip_addresses[0] if computer.ip_addresses else None
-
         ci = self.smax_service.find_ci_for_computer(
             name=computer.name,
-            ip=ip,
             ci_type=self.sync_config.smax_ci_type,
             network_type_field=self.sync_config.smax_network_type_field,
         )
@@ -986,8 +914,7 @@ class NetworkSyncService:
                 source=source,
                 network_type=network_type,
                 status=SyncStatus.NOT_FOUND_IN_SMAX,
-                message=f"No CI found in SMAX matching '{computer.name}'"
-                        + (f" or IP '{ip}'" if ip else ""),
+                message=f"No CI found in SMAX matching '{computer.name}'",
             )
 
         # Check current value

@@ -17,7 +17,7 @@ import csv
 import json
 import logging
 import sys
-from dataclasses import dataclass, field
+from dataclasses import dataclass
 from datetime import datetime
 from typing import Dict, List, Optional
 
@@ -69,13 +69,6 @@ class ADComputer:
     """Represents an Active Directory computer object"""
     name: str
     distinguished_name: str
-    dns_hostname: Optional[str] = None
-    operating_system: Optional[str] = None
-    when_changed: Optional[str] = None
-    when_created: Optional[str] = None
-    ip_addresses: List[str] = field(default_factory=list)
-    description: Optional[str] = None
-    enabled: bool = True
 
 
 # =============================================================================
@@ -187,12 +180,8 @@ class ADClient:
         attributes = [
             "cn",
             "distinguishedName",
-            "dNSHostName",
-            "operatingSystem",
             "whenChanged",
             "whenCreated",
-            "description",
-            "userAccountControl",
         ]
 
         computers = []
@@ -221,69 +210,17 @@ class ADClient:
         """Extract attributes from an LDAP entry into an ADComputer dataclass"""
         attrs = entry.get("attributes", {})
 
-        # Parse name
         name = attrs.get("cn", "")
         if isinstance(name, list):
             name = name[0] if name else ""
 
-        # Parse distinguished name
         dn = attrs.get("distinguishedName", "")
         if isinstance(dn, list):
             dn = dn[0] if dn else ""
 
-        # Parse DNS hostname
-        dns_hostname = attrs.get("dNSHostName", None)
-        if isinstance(dns_hostname, list):
-            dns_hostname = dns_hostname[0] if dns_hostname else None
-
-        # Parse operating system
-        os_name = attrs.get("operatingSystem", None)
-        if isinstance(os_name, list):
-            os_name = os_name[0] if os_name else None
-
-        # Parse timestamps
-        when_changed = attrs.get("whenChanged", None)
-        if isinstance(when_changed, list):
-            when_changed = when_changed[0] if when_changed else None
-        if isinstance(when_changed, datetime):
-            when_changed = when_changed.isoformat()
-        elif when_changed:
-            when_changed = str(when_changed)
-
-        when_created = attrs.get("whenCreated", None)
-        if isinstance(when_created, list):
-            when_created = when_created[0] if when_created else None
-        if isinstance(when_created, datetime):
-            when_created = when_created.isoformat()
-        elif when_created:
-            when_created = str(when_created)
-
-        # Parse description
-        description = attrs.get("description", None)
-        if isinstance(description, list):
-            description = description[0] if description else None
-
-        # Parse enabled status from userAccountControl
-        uac = attrs.get("userAccountControl", 0)
-        if isinstance(uac, list):
-            uac = uac[0] if uac else 0
-        try:
-            uac = int(uac)
-        except (ValueError, TypeError):
-            uac = 0
-        # Bit 0x0002 = ACCOUNTDISABLE
-        enabled = not bool(uac & 0x0002)
-
         return ADComputer(
             name=name,
             distinguished_name=dn,
-            dns_hostname=dns_hostname,
-            operating_system=os_name,
-            when_changed=when_changed,
-            when_created=when_created,
-            ip_addresses=[],
-            description=description,
-            enabled=enabled,
         )
 
     def __enter__(self):
@@ -304,13 +241,6 @@ def export_to_csv(computers: List[ADComputer], output_path: str) -> None:
     headers = [
         "Name",
         "DistinguishedName",
-        "DNSHostName",
-        "OperatingSystem",
-        "WhenChanged",
-        "WhenCreated",
-        "IPAddresses",
-        "Description",
-        "Enabled",
     ]
 
     with open(output_path, "w", newline="", encoding="utf-8") as f:
@@ -321,13 +251,6 @@ def export_to_csv(computers: List[ADComputer], output_path: str) -> None:
             writer.writerow([
                 c.name,
                 c.distinguished_name,
-                c.dns_hostname or "",
-                c.operating_system or "",
-                c.when_changed or "",
-                c.when_created or "",
-                ";".join(c.ip_addresses),
-                c.description or "",
-                str(c.enabled),
             ])
 
     logger.info(f"Exported {len(computers)} computers to {output_path}")
