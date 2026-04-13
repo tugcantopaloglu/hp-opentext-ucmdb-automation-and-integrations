@@ -857,6 +857,9 @@ class MergeService:
                 all_relations_ok = False
 
         # Step 4: Copy missing properties
+        # Properties that should always be taken from UCMDB CI (overwrite SMAX value)
+        ALWAYS_FROM_UCMDB = {"serial_number"}
+
         props_to_copy = {}
         for prop_name, prop_value in ucmdb_props.items():
             if prop_name.lower() in {p.lower() for p in SYSTEM_PROPERTIES}:
@@ -864,16 +867,17 @@ class MergeService:
 
             smax_value = smax_props.get(prop_name)
 
-            # Only copy if SMAX CI is missing this property (None or empty)
             if prop_value is not None and prop_value != "":
+                always_overwrite = prop_name.lower() in {p.lower() for p in ALWAYS_FROM_UCMDB}
                 is_missing = smax_value is None or smax_value == ""
+                should_copy = is_missing or always_overwrite
                 prop_result = PropertyCopyResult(
                     property_name=prop_name,
                     source_value=prop_value,
                     was_missing=is_missing,
                 )
 
-                if is_missing:
+                if should_copy:
                     props_to_copy[prop_name] = prop_value
                     prop_result.copy_success = True  # will be set properly below
 
@@ -883,14 +887,14 @@ class MergeService:
             if dry_run:
                 logger.info(f"  [DRY RUN] Would copy {len(props_to_copy)} properties")
                 for pc in result.properties_copied:
-                    if pc.was_missing:
+                    if pc.property_name in props_to_copy:
                         pc.copy_success = True
             else:
                 success = self.ucmdb.update_ci_properties(
                     pair.smax_ci.ucmdb_id, smax_ci_type, props_to_copy
                 )
                 for pc in result.properties_copied:
-                    if pc.was_missing:
+                    if pc.property_name in props_to_copy:
                         pc.copy_success = success
                 if success:
                     logger.info(f"  Copied {len(props_to_copy)} properties to SMAX CI")
