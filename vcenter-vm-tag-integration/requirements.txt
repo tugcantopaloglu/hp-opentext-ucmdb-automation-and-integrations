@@ -1,6 +1,6 @@
 # VMware-SMAX Bridge dependencies
 # No pyvmomi required - uses VMware REST API only
 
-requests>=2.28.0
+requests>=2.33.0
 urllib3>=1.26.0
 openpyxl>=3.1.0  # For Excel import/export
