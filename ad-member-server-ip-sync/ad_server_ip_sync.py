@@ -76,7 +76,7 @@ class SyncConfig:
     smax_ci_type: str = "Device"
     smax_ci_subtype: Optional[str] = "Server"
     smax_matching_field: str = "DisplayLabel"
-    smax_alt_matching_field: str = "PrimaryIP"
+    smax_alt_matching_field: str = ""
     smax_target_field: str = "AgBiosAdi"
     name_patterns: List[str] = field(default_factory=list)
     state_file_path: str = ".server_ip_sync_state.json"
@@ -112,8 +112,6 @@ class CIRecord:
     display_label: str
     ci_type: str
     target_field_value: Optional[str] = None
-    primary_ip: Optional[str] = None
-    dns_name: Optional[str] = None
     properties: Dict[str, Any] = None
 
     def __post_init__(self):
@@ -600,7 +598,7 @@ class SMAXClient:
         if subtype:
             filter_expr = f"(DisplayLabel = '{self._escape_query(name)}') and (SubType = '{subtype}')"
         params = {
-            "layout": f"Id,DisplayLabel,PrimaryIP,DnsName,SubType,{target_field}",
+            "layout": f"Id,DisplayLabel,SubType,{target_field}",
             "filter": filter_expr,
         }
 
@@ -619,49 +617,6 @@ class SMAXClient:
                     display_label=props.get("DisplayLabel", ""),
                     ci_type=ci_type,
                     target_field_value=props.get(target_field),
-                    primary_ip=props.get("PrimaryIP"),
-                    dns_name=props.get("DnsName"),
-                    properties=props,
-                )
-
-        return None
-
-    def get_ci_by_ip(
-        self,
-        ip_address: str,
-        ci_type: str = "Device",
-        target_field: str = "AgBiosAdi",
-        subtype: Optional[str] = None,
-    ) -> Optional[CIRecord]:
-        """Search for a CI by its IP address"""
-        self._ensure_authenticated()
-
-        url = f"{self.base_url}/ems/{ci_type}"
-        filter_expr = f"(PrimaryIP = '{self._escape_query(ip_address)}')"
-        if subtype:
-            filter_expr = f"(PrimaryIP = '{self._escape_query(ip_address)}') and (SubType = '{subtype}')"
-        params = {
-            "layout": f"Id,DisplayLabel,PrimaryIP,DnsName,SubType,{target_field}",
-            "filter": filter_expr,
-        }
-
-        response = self.session.get(url, params=params)
-
-        if response.ok:
-            data = response.json()
-            entities = data.get("entities", [])
-
-            if entities:
-                entity = entities[0]
-                props = entity.get("properties", {})
-
-                return CIRecord(
-                    id=entity.get("entity_type", "") + "/" + str(props.get("Id")),
-                    display_label=props.get("DisplayLabel", ""),
-                    ci_type=ci_type,
-                    target_field_value=props.get(target_field),
-                    primary_ip=props.get("PrimaryIP"),
-                    dns_name=props.get("DnsName"),
                     properties=props,
                 )
 
@@ -669,9 +624,9 @@ class SMAXClient:
 
     def search_cis(
         self,
-        ci_type: str = "Server",
+        ci_type: str = "Device",
         filter_query: Optional[str] = None,
-        layout: str = "Id,DisplayLabel,PrimaryIP,DnsName",
+        layout: str = "Id,DisplayLabel,SubType",
         skip: int = 0,
         size: int = 100,
     ) -> List[CIRecord]:
@@ -691,6 +646,14 @@ class SMAXClient:
             return []
 
         data = response.json()
+
+        # Check for SMAX-level errors in meta
+        meta = data.get("meta", {})
+        if meta.get("completion_status") == "FAILED":
+            error_msg = meta.get("errorDetails", {}).get("message", "unknown")
+            logger.error(f"SMAX query error: {error_msg}")
+            return []
+
         entities = data.get("entities", [])
 
         cis = []
@@ -701,8 +664,6 @@ class SMAXClient:
                     id=entity.get("entity_type", "") + "/" + str(props.get("Id")),
                     display_label=props.get("DisplayLabel", ""),
                     ci_type=ci_type,
-                    primary_ip=props.get("PrimaryIP"),
-                    dns_name=props.get("DnsName"),
                     properties=props,
                 )
             )
@@ -716,7 +677,7 @@ class SMAXClient:
         subtype: Optional[str] = None,
     ) -> List[CIRecord]:
         """Get all CIs of a specific type (handles pagination)"""
-        layout = f"Id,DisplayLabel,PrimaryIP,DnsName,SubType,{target_field}"
+        layout = f"Id,DisplayLabel,SubType,{target_field}"
         filter_query = None
         if subtype:
             filter_query = f"(SubType = '{subtype}')"
@@ -834,34 +795,19 @@ class SMAXService:
     def find_ci_for_server(
         self,
         name: str,
-        ip: Optional[str] = None,
         ci_type: str = "Device",
         target_field: str = "AgBiosAdi",
         subtype: Optional[str] = None,
     ) -> Optional[CIRecord]:
-        """Find a CI that matches a server by name, fallback by IP"""
-        # Check cache by display_label
+        """Find a CI that matches a server by DisplayLabel"""
         cache_key = name.lower()
         if cache_key in self._ci_cache:
             return self._ci_cache[cache_key]
 
-        # Check cache by IP
-        if ip:
-            ip_key = ip.lower()
-            if ip_key in self._ci_cache:
-                return self._ci_cache[ip_key]
-
-        # Search SMAX by name
         ci = self.client.get_ci_by_name(name, ci_type, target_field, subtype)
-
-        # Fallback: search by IP
-        if not ci and ip:
-            ci = self.client.get_ci_by_ip(ip, ci_type, target_field, subtype)
 
         if ci:
             self._ci_cache[cache_key] = ci
-            if ci.primary_ip:
-                self._ci_cache[ci.primary_ip.lower()] = ci
 
         return ci
 
@@ -877,8 +823,6 @@ class SMAXService:
         for ci in cis:
             if ci.display_label:
                 self._ci_cache[ci.display_label.lower()] = ci
-            if ci.primary_ip:
-                self._ci_cache[ci.primary_ip.lower()] = ci
 
         logger.info(f"Loaded {len(cis)} CIs into cache")
 
@@ -970,7 +914,6 @@ class ServerIPSyncService:
 
         ci = self.smax_service.find_ci_for_server(
             name=server.name,
-            ip=server.ip_address,
             ci_type=self.sync_config.smax_ci_type,
             target_field=self.sync_config.smax_target_field,
             subtype=self.sync_config.smax_ci_subtype,
@@ -1202,7 +1145,7 @@ def load_config_from_file(config_path: str) -> AppConfig:
             smax_ci_type=sync_data.get("smax_ci_type", "Device"),
             smax_ci_subtype=sync_data.get("smax_ci_subtype", "Server"),
             smax_matching_field=sync_data.get("smax_matching_field", "DisplayLabel"),
-            smax_alt_matching_field=sync_data.get("smax_alt_matching_field", "PrimaryIP"),
+            smax_alt_matching_field=sync_data.get("smax_alt_matching_field", ""),
             smax_target_field=sync_data.get("smax_target_field", "AgBiosAdi"),
             name_patterns=sync_data.get("name_patterns", []),
             state_file_path=sync_data.get("state_file_path", ".server_ip_sync_state.json"),
@@ -1235,7 +1178,7 @@ def generate_config_template(output_path: str) -> None:
             "smax_ci_type": "Device",
             "smax_ci_subtype": "Server",
             "smax_matching_field": "DisplayLabel",
-            "smax_alt_matching_field": "PrimaryIP",
+            "smax_alt_matching_field": "",
             "smax_target_field": "AgBiosAdi",
             "name_patterns": [],
             "state_file_path": ".server_ip_sync_state.json",
@@ -1332,33 +1275,58 @@ def run_lookup_command(config: AppConfig, args) -> None:
     print("=" * 60)
 
     with SMAXClient(config.smax) as client:
-        # Query 1: No filters, just DisplayLabel
-        print(f"\n[1] Exact match: DisplayLabel = '{name}'")
+        # Query 1: Exact match with safe fields only
+        print(f"\n[1] Exact match: DisplayLabel = '{name}' (safe layout)")
         url = f"{client.base_url}/ems/{ci_type}"
         params = {
-            "layout": "Id,DisplayLabel,PrimaryIP,DnsName,SubType",
+            "layout": "Id,DisplayLabel,SubType",
             "filter": f"(DisplayLabel = '{client._escape_query(name)}')",
         }
         response = client.session.get(url, params=params)
         print(f"    Status: {response.status_code}")
         if response.ok:
             data = response.json()
+            meta = data.get("meta", {})
+            if meta.get("completion_status") == "FAILED":
+                print(f"    SMAX error: {meta.get('errorDetails', {}).get('message', 'unknown')}")
             entities = data.get("entities", [])
             print(f"    Results: {len(entities)}")
             for e in entities[:5]:
                 props = e.get("properties", {})
                 print(f"    -> DisplayLabel='{props.get('DisplayLabel')}' "
                       f"SubType='{props.get('SubType')}' "
-                      f"PrimaryIP='{props.get('PrimaryIP')}' "
                       f"Id='{props.get('Id')}'")
+                # Show all properties to discover available fields
+                print(f"       All fields: {list(props.keys())}")
         else:
             print(f"    Error: {response.text[:300]}")
+
+        # Query 1b: Get all fields for this CI
+        if entities:
+            ci_id = entities[0].get("properties", {}).get("Id")
+            print(f"\n[1b] All fields for CI Id={ci_id}")
+            try:
+                params1b = {
+                    "filter": f"(Id = '{ci_id}')",
+                }
+                response1b = client.session.get(url, params=params1b)
+                if response1b.ok:
+                    data1b = response1b.json()
+                    entities1b = data1b.get("entities", [])
+                    if entities1b:
+                        props1b = entities1b[0].get("properties", {})
+                        print(f"    Field count: {len(props1b)}")
+                        for k, v in sorted(props1b.items()):
+                            if v is not None and v != "":
+                                print(f"    {k} = '{v}'")
+            except Exception as e:
+                print(f"    Failed: {e}")
 
         # Query 2: List first 10 CIs to see what data looks like
         print(f"\n[2] First 10 CIs of type '{ci_type}' (sanity check)")
         try:
             params2 = {
-                "layout": "Id,DisplayLabel,SubType,PrimaryIP",
+                "layout": "Id,DisplayLabel,SubType",
                 "size": 10,
             }
             response2 = client.session.get(url, params=params2)
@@ -1370,36 +1338,37 @@ def run_lookup_command(config: AppConfig, args) -> None:
                 for e in entities2:
                     props = e.get("properties", {})
                     print(f"    -> DisplayLabel='{props.get('DisplayLabel')}' "
-                          f"SubType='{props.get('SubType')}' "
-                          f"PrimaryIP='{props.get('PrimaryIP')}'")
+                          f"SubType='{props.get('SubType')}'")
             else:
                 print(f"    Error: {response2.text[:300]}")
         except Exception as e:
             print(f"    Failed: {e}")
 
-        # Query 3: Try with SubType=Server filter
+        # Query 3: Try with SubType filter, safe fields only
         subtype = config.sync.smax_ci_subtype
         if subtype:
-            print(f"\n[3] First 10 CIs with SubType='{subtype}'")
+            print(f"\n[3] First 5 CIs with SubType='{subtype}' (safe layout)")
             try:
                 params3 = {
-                    "layout": "Id,DisplayLabel,SubType,PrimaryIP",
+                    "layout": "Id,DisplayLabel,SubType",
                     "filter": f"(SubType = '{subtype}')",
-                    "size": 10,
+                    "size": 5,
                 }
                 response3 = client.session.get(url, params=params3)
                 print(f"    Status: {response3.status_code}")
                 if response3.ok:
                     data3 = response3.json()
+                    meta3 = data3.get("meta", {})
+                    if meta3.get("completion_status") == "FAILED":
+                        print(f"    SMAX error: {meta3.get('errorDetails', {}).get('message', 'unknown')}")
                     entities3 = data3.get("entities", [])
-                    print(f"    Total results: {data3.get('meta', {}).get('total_count', len(entities3))}")
+                    print(f"    Total: {meta3.get('total_count', '?')}, returned: {len(entities3)}")
                     for e in entities3:
                         props = e.get("properties", {})
                         print(f"    -> DisplayLabel='{props.get('DisplayLabel')}' "
-                              f"SubType='{props.get('SubType')}' "
-                              f"PrimaryIP='{props.get('PrimaryIP')}'")
+                              f"SubType='{props.get('SubType')}'")
                 else:
-                    print(f"    Error: {response3.text[:300]}")
+                    print(f"    Error: {response3.text[:500]}")
             except Exception as e:
                 print(f"    Failed: {e}")
 
