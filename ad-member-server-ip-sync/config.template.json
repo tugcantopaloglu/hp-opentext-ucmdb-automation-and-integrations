@@ -1,0 +1,33 @@
+{
+  "active_directory": {
+    "server": "dc01.example.com",
+    "domain": "EXAMPLE",
+    "username": "svc_account",
+    "password": "your-password",
+    "base_dn": "OU=ServerGroup,DC=example,DC=com",
+    "use_ssl": true
+  },
+  "smax": {
+    "base_url": "https://smax.example.com",
+    "tenant_id": "your-tenant-id",
+    "username": "admin",
+    "password": "your-password",
+    "api_token": null
+  },
+  "export": {
+    "name_patterns": [],
+    "csv_output_path": "ad_servers.csv",
+    "state_file_path": ".ad_server_export_state.json"
+  },
+  "sync": {
+    "csv_input_path": "ad_servers.csv",
+    "smax_ci_type": "Server",
+    "smax_matching_field": "DisplayLabel",
+    "smax_alt_matching_field": "PrimaryIP",
+    "smax_target_field": "AgBiosAdi",
+    "name_patterns": [],
+    "state_file_path": ".server_ip_sync_state.json",
+    "dry_run": false,
+    "batch_size": 50
+  }
+}

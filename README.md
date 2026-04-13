@@ -4,3 +4,4 @@ OpenText UCMDB/CMDB (previously held by HP) automation and integrations with SMA
 - vcenter-vm-tag-integration -> Module is tested and can be used in production env.
 - network-change-and-check-fix -> Module is tested and can be used in production env.
 - duplicate-ci-with-custom-arragements -> Module is tested and can be used in production env.
+- ad-member-server-ip-sync -> Module is in development.
