@@ -509,27 +509,24 @@ class UCMDBClient:
         logger.error(f"Failed to delete CI {ci_id}: {response.status_code} {response.text}")
         return False
 
-    def query_cis_by_type(self, ci_type: str) -> List[Dict]:
+    def query_cis_by_type(self, ci_type: str, layout: List[str] = None) -> List[Dict]:
         """Query all CIs of a given type using topology query"""
         self._ensure_authenticated()
 
         url = f"{self.base_url}/topologyQuery"
 
-        # Use a simple TQL-style query to get all CIs of the given type
+        node_def = {
+            "queryIdentifier": "node1",
+            "type": ci_type,
+            "visible": True,
+            "includeSubtypes": True,
+        }
+        if layout:
+            node_def["layout"] = layout
+
         payload = {
-            "queryName": None,
-            "queryExpression": {
-                "nodes": [
-                    {
-                        "nodeId": "node1",
-                        "type": ci_type,
-                        "visible": True,
-                        "queryIdentifier": "node1",
-                    }
-                ],
-                "relationships": [],
-            },
-            "propertiesFilterList": [],
+            "nodes": [node_def],
+            "relations": [],
         }
 
         response = self.session.post(url, json=payload)
@@ -706,15 +703,24 @@ class MergeService:
         """
         Detect duplicate CIs by matching (name, _NetworkType).
         A duplicate pair = 1 SMAX-sourced + 1 UCMDB-sourced CI with same key.
+
+        Two-phase approach:
+        1. Topology query to get all CIs with name/_NetworkType (lightweight)
+        2. For potential duplicate groups only, fetch full CI details via get_ci
+           to check createdby (system property not returned by topology query)
         """
         logger.info(f"Querying all CIs of type '{self.merge_config.ci_type}' from UCMDB...")
-        raw_cis = self.ucmdb.query_cis_by_type(self.merge_config.ci_type)
+        layout = [
+            self.merge_config.name_property,
+            self.merge_config.network_type_property,
+        ]
+        raw_cis = self.ucmdb.query_cis_by_type(self.merge_config.ci_type, layout=layout)
 
         if not raw_cis:
             logger.warning("No CIs found in UCMDB")
             return []
 
-        # Parse CIs
+        # Phase 1: Parse CIs with basic info (no createdby yet)
         ci_records = []
         for raw_ci in raw_cis:
             ci_record = self._parse_ci(raw_ci)
@@ -722,10 +728,6 @@ class MergeService:
                 ci_records.append(ci_record)
 
         logger.info(f"Parsed {len(ci_records)} CIs with valid names")
-
-        smax_count = sum(1 for c in ci_records if c.is_smax_sourced)
-        ucmdb_count = len(ci_records) - smax_count
-        logger.info(f"  SMAX-sourced: {smax_count}, UCMDB-sourced: {ucmdb_count}")
 
         # Group by (name.lower(), network_type)
         groups: Dict[tuple, List[UCMDBCIRecord]] = {}
@@ -735,12 +737,34 @@ class MergeService:
                 groups[key] = []
             groups[key].append(ci)
 
+        # Phase 2: For groups with 2+ CIs, fetch full details to determine source
+        candidate_groups = {k: v for k, v in groups.items() if len(v) >= 2}
+        candidate_count = sum(len(v) for v in candidate_groups.values())
+        logger.info(
+            f"Found {len(candidate_groups)} name groups with 2+ CIs "
+            f"({candidate_count} CIs to enrich)"
+        )
+
+        for key, group in candidate_groups.items():
+            for i, ci in enumerate(group):
+                full_ci = self.ucmdb.get_ci(ci.ucmdb_id)
+                if full_ci:
+                    full_props = full_ci.get("properties", {})
+                    created_by = full_props.get("createdby", "")
+                    ci.created_by = created_by
+                    ci.is_smax_sourced = (
+                        self.merge_config.smax_created_by_marker.lower()
+                        in (created_by or "").lower()
+                    )
+                    ci.properties = full_props
+                    logger.debug(
+                        f"  Enriched '{ci.name}' ({ci.ucmdb_id}): "
+                        f"createdby='{created_by}' smax={ci.is_smax_sourced}"
+                    )
+
         # Find duplicate pairs
         pairs = []
-        for key, group in groups.items():
-            if len(group) < 2:
-                continue
-
+        for key, group in candidate_groups.items():
             smax_cis = [c for c in group if c.is_smax_sourced]
             ucmdb_cis = [c for c in group if not c.is_smax_sourced]
 
@@ -756,7 +780,7 @@ class MergeService:
                     f"  Duplicate found: '{key[0]}' (NetworkType: {key[1] or 'N/A'}) "
                     f"SMAX={smax_cis[0].ucmdb_id} UCMDB={ucmdb_cis[0].ucmdb_id}"
                 )
-            elif len(group) > 2 or len(smax_cis) != 1 or len(ucmdb_cis) != 1:
+            elif len(smax_cis) != 1 or len(ucmdb_cis) != 1:
                 logger.warning(
                     f"  Ambiguous group for '{key[0]}' (NetworkType: {key[1] or 'N/A'}): "
                     f"{len(smax_cis)} SMAX-sourced, {len(ucmdb_cis)} UCMDB-sourced - SKIPPING"
