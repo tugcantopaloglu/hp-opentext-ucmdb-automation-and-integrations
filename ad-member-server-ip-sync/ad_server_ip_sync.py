@@ -323,6 +323,16 @@ class ADClient:
     def __init__(self, config: ADConfig):
         self.config = config
         self.connection = None
+        self._dns_suffix = self._build_dns_suffix()
+
+    def _build_dns_suffix(self) -> str:
+        """Build DNS suffix from base_dn DC components (e.g. DC=example,DC=com -> example.com)"""
+        parts = [
+            p.split("=", 1)[1]
+            for p in self.config.base_dn.split(",")
+            if p.strip().upper().startswith("DC=")
+        ]
+        return ".".join(parts) if parts else ""
 
     def connect(self) -> None:
         """Bind to Active Directory"""
@@ -433,7 +443,23 @@ class ADClient:
         if isinstance(dns_hostname, list):
             dns_hostname = dns_hostname[0] if dns_hostname else ""
 
-        ip_address = resolve_ip(dns_hostname) if dns_hostname else None
+        # Try multiple resolution strategies:
+        # 1. dNSHostName from AD (FQDN)
+        # 2. cn (computer name) alone
+        # 3. cn + domain suffix as FQDN
+        ip_address = None
+
+        if dns_hostname:
+            ip_address = resolve_ip(dns_hostname)
+
+        if not ip_address:
+            logger.debug(f"dNSHostName resolution failed for {name}, trying cn...")
+            ip_address = resolve_ip(name)
+
+        if not ip_address and self._dns_suffix:
+            fqdn = f"{name}.{self._dns_suffix}"
+            logger.debug(f"cn resolution failed for {name}, trying FQDN: {fqdn}")
+            ip_address = resolve_ip(fqdn)
 
         if not ip_address:
             logger.warning(f"Could not resolve IP for: {name} (dNSHostName: {dns_hostname})")

@@ -700,9 +700,12 @@ class SMAXClient:
         ci_type: str = "Device",
         target_field: str = "OsType",
         subtype: Optional[str] = None,
+        extra_fields: Optional[List[str]] = None,
     ) -> List[CIRecord]:
         """Get all CIs of a specific type (handles pagination)"""
         layout = f"Id,DisplayLabel,SubType,{target_field}"
+        if extra_fields:
+            layout += "," + ",".join(extra_fields)
         filter_query = None
         if subtype:
             filter_query = f"(SubType = '{subtype}')"
@@ -1272,6 +1275,94 @@ def run_sync(config: AppConfig, args) -> None:
         print(f"Detailed report saved to: {args.output}")
 
 
+def run_fill_empty(config: AppConfig, args) -> None:
+    """Find CIs with empty OS type in SMAX and set them to a default value"""
+    dry_run = args.dry_run
+    default_value = args.value
+    target_field = config.sync.smax_target_field
+
+    if dry_run:
+        logger.info("DRY RUN MODE: No actual changes will be made")
+
+    logger.info(f"Searching SMAX for CIs with empty '{target_field}'...")
+
+    smax = SMAXClient(config.smax)
+    smax.connect()
+
+    # Load all CIs with target field and Owner
+    all_cis = smax.get_all_cis(
+        ci_type=config.sync.smax_ci_type,
+        target_field=target_field,
+        subtype=config.sync.smax_ci_subtype,
+        extra_fields=["OwnedByPerson"],
+    )
+
+    # Filter to empty target field AND Owner must be set
+    empty_cis = []
+    skipped_no_owner = 0
+    for ci in all_cis:
+        target_val = ci.target_field_value
+        is_empty = not target_val or str(target_val).strip() == ""
+        if not is_empty:
+            continue
+        owner = ci.properties.get("OwnedByPerson")
+        if not owner or str(owner).strip() == "":
+            skipped_no_owner += 1
+            continue
+        empty_cis.append(ci)
+
+    logger.info(
+        f"Found {len(empty_cis)} CIs with empty '{target_field}' and Owner set "
+        f"(out of {len(all_cis)} total, {skipped_no_owner} skipped due to empty Owner)"
+    )
+
+    if not empty_cis:
+        print(f"\nNo CIs found with empty '{target_field}'. Nothing to do.")
+        smax.disconnect()
+        return
+
+    updated = 0
+    failed = 0
+    skipped = 0
+
+    for i, ci in enumerate(empty_cis, 1):
+        if i % 50 == 0:
+            logger.info(f"Progress: {i}/{len(empty_cis)}")
+
+        if dry_run:
+            logger.info(f"[DRY RUN] Would set '{target_field}' to '{default_value}' for {ci.display_label} ({ci.id})")
+            skipped += 1
+        else:
+            success = smax.update_ci_field(
+                ci_id=ci.id,
+                value=default_value,
+                field_name=target_field,
+            )
+            if success:
+                updated += 1
+            else:
+                failed += 1
+
+    smax.disconnect()
+
+    print("\n" + "=" * 60)
+    print("Fill Empty OS Type Report")
+    print("=" * 60)
+    print(f"  Target field: {target_field}")
+    print(f"  Default value: {default_value}")
+    print(f"  CI type: {config.sync.smax_ci_type} / {config.sync.smax_ci_subtype or 'all'}")
+    print(f"  Total CIs scanned: {len(all_cis)}")
+    print(f"  CIs with empty field + Owner set: {len(empty_cis)}")
+    print(f"  Skipped (empty Owner): {skipped_no_owner}")
+    if dry_run:
+        print(f"  Would update: {skipped}")
+    else:
+        print(f"  Updated: {updated}")
+        print(f"  Failed: {failed}")
+    print("=" * 60)
+    print("")
+
+
 def view_report(args) -> None:
     """View a saved sync report"""
     try:
@@ -1325,6 +1416,11 @@ Examples:
   # Specific servers
   python ad_os_sync.py sync --config config.json --names "SRV*" "WS-*"
 
+  # Fill empty OS type fields in SMAX with 'Unix'
+  python ad_os_sync.py fill-empty --config config.json --dry-run
+  python ad_os_sync.py fill-empty --config config.json
+  python ad_os_sync.py fill-empty --config config.json --value "Windows"
+
   # Test connections
   python ad_os_sync.py test --config config.json
 
@@ -1359,6 +1455,14 @@ Examples:
     report_parser = subparsers.add_parser("report", help="View a saved sync report")
     report_parser.add_argument("--input", "-i", required=True, help="Path to report JSON file")
 
+    # Fill-empty command
+    fill_parser = subparsers.add_parser("fill-empty", help="Set empty OS type fields in SMAX to a default value")
+    fill_parser.add_argument("--config", "-c", required=True, help="Path to configuration JSON file")
+    fill_parser.add_argument("--value", default="Unix", help="Value to set for empty fields (default: Unix)")
+    fill_parser.add_argument("--dry-run", action="store_true", help="Simulate without making changes")
+    fill_parser.add_argument("--verbose", "-v", action="store_true", help="Enable verbose logging")
+    fill_parser.add_argument("--log-file", help="Log to file in addition to console")
+
     # Generate config command
     template_parser = subparsers.add_parser("generate-config", help="Generate a config template")
     template_parser.add_argument("--output", "-o", default="config.json", help="Output file path")
@@ -1391,6 +1495,8 @@ Examples:
         test_connections(config)
     elif args.command == "sync":
         run_sync(config, args)
+    elif args.command == "fill-empty":
+        run_fill_empty(config, args)
 
 
 if __name__ == "__main__":
