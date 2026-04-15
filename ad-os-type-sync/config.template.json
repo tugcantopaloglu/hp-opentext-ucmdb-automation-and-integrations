@@ -1,0 +1,33 @@
+{
+  "active_directory": {
+    "server": "dc01.example.com",
+    "domain": "EXAMPLE",
+    "username": "svc_account",
+    "password": "your-password",
+    "base_dn": "OU=MemberServers,DC=example,DC=com",
+    "use_ssl": true
+  },
+  "smax": {
+    "base_url": "https://smax.example.com",
+    "tenant_id": "your-tenant-id",
+    "username": "admin",
+    "password": "your-password",
+    "api_token": null
+  },
+  "export": {
+    "name_patterns": [],
+    "csv_output_path": "ad_os_servers.csv",
+    "state_file_path": ".ad_os_export_state.json"
+  },
+  "sync": {
+    "csv_input_path": "ad_os_servers.csv",
+    "smax_ci_type": "Device",
+    "smax_ci_subtype": "Server",
+    "smax_matching_field": "DisplayLabel",
+    "smax_target_field": "OsType",
+    "name_patterns": [],
+    "state_file_path": ".os_type_sync_state.json",
+    "dry_run": false,
+    "batch_size": 50
+  }
+}
