@@ -874,20 +874,21 @@ class ServerIPSyncService:
         self.smax_service = SMAXService(config.smax)
         self.sync_config = config.sync
 
-    def connect(self) -> None:
-        """Connect to AD and SMAX, pre-load CI cache"""
+    def connect(self, preload_cache: bool = True) -> None:
+        """Connect to AD and SMAX, optionally pre-load CI cache"""
         logger.info("Connecting to AD...")
         self.ad_client.connect()
 
         logger.info("Connecting to SMAX...")
         self.smax_service.connect()
 
-        logger.info("Loading CIs from SMAX...")
-        self.smax_service.load_all_cis(
-            ci_type=self.sync_config.smax_ci_type,
-            target_field=self.sync_config.smax_target_field,
-            subtype=self.sync_config.smax_ci_subtype,
-        )
+        if preload_cache:
+            logger.info("Loading CIs from SMAX...")
+            self.smax_service.load_all_cis(
+                ci_type=self.sync_config.smax_ci_type,
+                target_field=self.sync_config.smax_target_field,
+                subtype=self.sync_config.smax_ci_subtype,
+            )
 
     def disconnect(self) -> None:
         """Disconnect from all services"""
@@ -1002,6 +1003,82 @@ class ServerIPSyncService:
                 ci_id=ci.id,
             )
 
+    def _resolve_names_directly(
+        self,
+        names: List[str],
+    ) -> List[Tuple[ServerInfo, str]]:
+        """
+        Resolve IPs directly for a list of explicit server names.
+        Used for --names fast path (no cache preload needed).
+        """
+        dns_suffix = self.ad_client._dns_suffix
+        results = []
+
+        for name in names:
+            ip_address = resolve_ip(name)
+
+            if not ip_address and dns_suffix:
+                fqdn = f"{name}.{dns_suffix}"
+                logger.debug(f"Trying FQDN: {fqdn}")
+                ip_address = resolve_ip(fqdn)
+
+            if ip_address:
+                results.append((
+                    ServerInfo(name=name, ip_address=ip_address, dns_hostname=""),
+                    "dns_resolve",
+                ))
+            else:
+                logger.warning(f"Could not resolve IP for: {name}")
+                results.append((
+                    ServerInfo(name=name, ip_address="", dns_hostname=""),
+                    "dns_resolve",
+                ))
+
+        logger.info(f"Resolved {sum(1 for s, _ in results if s.ip_address)} / {len(names)} names")
+        return results
+
+    def _resolve_smax_only_servers(
+        self,
+        existing_names: set,
+        name_patterns: Optional[List[str]] = None,
+    ) -> List[Tuple[ServerInfo, str]]:
+        """
+        Resolve IPs for SMAX CIs that are NOT in the AD/CSV server list.
+        Uses the DisplayLabel as hostname and tries DNS resolution with fallback.
+        """
+        dns_suffix = self.ad_client._dns_suffix
+        smax_only = []
+
+        for label_lower, ci in self.smax_service._ci_cache.items():
+            if label_lower in existing_names:
+                continue
+
+            name = ci.display_label
+
+            # Apply name pattern filter early
+            if name_patterns:
+                if not any(fnmatch.fnmatch(name.upper(), p.upper()) for p in name_patterns):
+                    continue
+
+            # Try multiple resolution strategies (same as AD parse)
+            ip_address = resolve_ip(name)
+
+            if not ip_address and dns_suffix:
+                fqdn = f"{name}.{dns_suffix}"
+                logger.debug(f"Trying FQDN for SMAX CI: {fqdn}")
+                ip_address = resolve_ip(fqdn)
+
+            if ip_address:
+                smax_only.append((
+                    ServerInfo(name=name, ip_address=ip_address, dns_hostname=""),
+                    "smax_resolve",
+                ))
+            else:
+                logger.debug(f"Could not resolve IP for SMAX-only CI: {name}")
+
+        logger.info(f"Resolved {len(smax_only)} IPs from SMAX-only CIs")
+        return smax_only
+
     def sync_all(
         self,
         full: bool = False,
@@ -1015,10 +1092,11 @@ class ServerIPSyncService:
         1. Load CSV servers (from Network A export)
         2. Load AD live servers with DNS resolution (Network B)
         3. Merge & deduplicate (live AD takes precedence)
-        4. Apply name pattern filters
-        5. Process each server
-        6. Generate report
-        7. Save state
+        4. Resolve IPs for SMAX-only CIs (not in AD/CSV)
+        5. Apply name pattern filters
+        6. Process each server
+        7. Generate report
+        8. Save state
         """
         report = SyncReport(start_time=datetime.now())
 
@@ -1026,53 +1104,67 @@ class ServerIPSyncService:
         if name_overrides:
             self.sync_config.name_patterns = name_overrides
 
-        # Determine modified_after for live AD query
-        modified_after = None
-        if not full:
-            state = load_state(self.sync_config.state_file_path)
-            last_run = state.get("last_run")
-            if last_run:
-                modified_after = datetime.fromisoformat(last_run)
-                logger.info(f"Incremental mode: AD servers modified after {last_run}")
-            else:
-                logger.info("No previous state found - full AD scan")
-
-        # Load from CSV source
-        csv_servers: List[Tuple[ServerInfo, str]] = []
-        if not ad_only:
-            logger.info(f"Loading servers from CSV: {self.sync_config.csv_input_path}")
-            csv_servers = self._load_csv_servers()
-            report.sources_processed.append(f"csv:{self.sync_config.csv_input_path}")
-            logger.info(f"Loaded {len(csv_servers)} servers from CSV")
-
-        # Load from live AD source
-        ad_servers: List[Tuple[ServerInfo, str]] = []
-        if not csv_only:
-            logger.info("Querying live AD for servers and resolving IPs...")
-            ad_servers = self._load_ad_servers(modified_after=modified_after)
-            report.sources_processed.append("ad_live")
-            logger.info(f"Loaded {len(ad_servers)} servers from live AD")
-
-        # Merge: build dict keyed by lowercase name, AD live overrides CSV
-        merged: Dict[str, Tuple[ServerInfo, str]] = {}
-
-        for server, source in csv_servers:
-            key = server.name.lower()
-            merged[key] = (server, source)
-
-        for server, source in ad_servers:
-            key = server.name.lower()
-            merged[key] = (server, source)  # AD overrides CSV
-
-        # Apply name filters
-        all_items = list(merged.values())
+        # --names fast path: resolve only the given names via DNS, skip AD/CSV/cache
         if name_overrides:
-            all_items = [
-                (s, src) for s, src in all_items
-                if any(fnmatch.fnmatch(s.name.upper(), p.upper()) for p in name_overrides)
-            ]
+            logger.info(f"Fast path: resolving {len(name_overrides)} name(s) directly")
+            all_items = self._resolve_names_directly(name_overrides)
+            report.sources_processed.append("dns_resolve")
+            report.total_servers = len(all_items)
+        else:
+            # Full pipeline: CSV + AD + SMAX-only
 
-        report.total_servers = len(all_items)
+            # Determine modified_after for live AD query
+            modified_after = None
+            if not full:
+                state = load_state(self.sync_config.state_file_path)
+                last_run = state.get("last_run")
+                if last_run:
+                    modified_after = datetime.fromisoformat(last_run)
+                    logger.info(f"Incremental mode: AD servers modified after {last_run}")
+                else:
+                    logger.info("No previous state found - full AD scan")
+
+            # Load from CSV source
+            csv_servers: List[Tuple[ServerInfo, str]] = []
+            if not ad_only:
+                logger.info(f"Loading servers from CSV: {self.sync_config.csv_input_path}")
+                csv_servers = self._load_csv_servers()
+                report.sources_processed.append(f"csv:{self.sync_config.csv_input_path}")
+                logger.info(f"Loaded {len(csv_servers)} servers from CSV")
+
+            # Load from live AD source
+            ad_servers: List[Tuple[ServerInfo, str]] = []
+            if not csv_only:
+                logger.info("Querying live AD for servers and resolving IPs...")
+                ad_servers = self._load_ad_servers(modified_after=modified_after)
+                report.sources_processed.append("ad_live")
+                logger.info(f"Loaded {len(ad_servers)} servers from live AD")
+
+            # Merge: build dict keyed by lowercase name, AD live overrides CSV
+            merged: Dict[str, Tuple[ServerInfo, str]] = {}
+
+            for server, source in csv_servers:
+                key = server.name.lower()
+                merged[key] = (server, source)
+
+            for server, source in ad_servers:
+                key = server.name.lower()
+                merged[key] = (server, source)  # AD overrides CSV
+
+            # Resolve IPs for SMAX CIs not found in AD/CSV
+            active_patterns = self.sync_config.name_patterns or None
+            logger.info("Resolving IPs for SMAX-only CIs...")
+            smax_only = self._resolve_smax_only_servers(
+                set(merged.keys()), name_patterns=active_patterns,
+            )
+            for server, source in smax_only:
+                key = server.name.lower()
+                merged[key] = (server, source)
+            report.sources_processed.append(f"smax_resolve({len(smax_only)})")
+            logger.info(f"Added {len(smax_only)} servers from SMAX-only DNS resolution")
+
+            all_items = list(merged.values())
+            report.total_servers = len(all_items)
         logger.info(f"Processing {len(all_items)} servers from {len(report.sources_processed)} source(s)...")
 
         # Process each server
@@ -1403,13 +1495,19 @@ def run_lookup_command(config: AppConfig, args) -> None:
 
 def run_sync_command(config: AppConfig, args) -> None:
     """Run the sync command"""
-    with ServerIPSyncService(config) as service:
+    service = ServerIPSyncService(config)
+    # Skip full SMAX cache preload when targeting specific names
+    preload = not bool(args.names)
+    service.connect(preload_cache=preload)
+    try:
         report = service.sync_all(
             full=args.full,
             csv_only=args.csv_only,
             ad_only=args.ad_only,
             name_overrides=args.names if args.names else None,
         )
+    finally:
+        service.disconnect()
 
     report.print_summary()
 
