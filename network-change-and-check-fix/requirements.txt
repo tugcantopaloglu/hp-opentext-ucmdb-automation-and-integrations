@@ -1,5 +1,6 @@
 # AD Network Change & Check Fix dependencies
 
 ldap3>=2.9.0
-requests>=2.28.0
+requests>=2.33.0
 urllib3>=1.26.0
+pyasn1>=0.6.3 # not directly required, pinned by Snyk to avoid a vulnerability
