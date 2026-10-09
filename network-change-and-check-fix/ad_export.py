@@ -17,7 +17,7 @@ import csv
 import json
 import logging
 import sys
-from dataclasses import dataclass
+from dataclasses import dataclass, field
 from datetime import datetime
 from typing import Dict, List, Optional
 
